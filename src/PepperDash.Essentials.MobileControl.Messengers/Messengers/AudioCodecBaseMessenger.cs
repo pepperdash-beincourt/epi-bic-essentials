@@ -1,22 +1,20 @@
 ﻿using System;
 using System.Linq;
 using Newtonsoft.Json.Linq;
-using PepperDash.Core;
-using PepperDash.Core.Logging;
 using PepperDash.Essentials.Devices.Common.AudioCodec;
 using PepperDash.Essentials.Devices.Common.Codec;
 
 namespace PepperDash.Essentials.AppServer.Messengers
 {
     /// <summary>
-    /// Provides a messaging bridge for an IDialerCallStatus device
+    /// Provides a messaging bridge for an AudioCodecBase device
     /// </summary>
-    public class IDialerCallStatusMessenger : MessengerBase
+    public class AudioCodecBaseMessenger : MessengerBase
     {
         /// <summary>
         /// Device being bridged
         /// </summary>
-        public IDialerCallStatus Codec { get; private set; }
+        public AudioCodecBase Codec { get; private set; }
 
         /// <summary>
         /// Constuctor
@@ -24,8 +22,8 @@ namespace PepperDash.Essentials.AppServer.Messengers
         /// <param name="key"></param>
         /// <param name="codec"></param>
         /// <param name="messagePath"></param>
-        public IDialerCallStatusMessenger(string key, IDialerCallStatus codec, string messagePath)
-            : base(key, messagePath, codec as IKeyName)
+        public AudioCodecBaseMessenger(string key, AudioCodecBase codec, string messagePath)
+            : base(key, messagePath, codec)
         {
             Codec = codec ?? throw new ArgumentNullException("codec");
             codec.CallStatusChange += Codec_CallStatusChange;
@@ -33,6 +31,7 @@ namespace PepperDash.Essentials.AppServer.Messengers
 
         /// <inheritdoc />
         protected override void RegisterActions()
+
         {
             base.RegisterActions();
 
@@ -104,25 +103,18 @@ namespace PepperDash.Essentials.AppServer.Messengers
         /// <returns></returns>
         private void SendAtcFullMessageObject(string id = null)
         {
-            try
-            {
-                var info = Codec.CodecInfo;
+            var info = Codec.CodecInfo;
 
-                PostStatusMessage(JToken.FromObject(new
-                {
-                    isInCall = Codec.IsInCall,
-                    calls = Codec.ActiveCalls,
-                    info = new
-                    {
-                        phoneNumber = info?.PhoneNumber
-                    }
-                }), id
-                );
-            }
-            catch (Exception ex)
+            PostStatusMessage(JToken.FromObject(new
             {
-                this.LogError(ex, "Error sending dialer call status full message");
-            }
+                isInCall = Codec.IsInCall,
+                calls = Codec.ActiveCalls,
+                info = new
+                {
+                    phoneNumber = info?.PhoneNumber
+                }
+            }), id
+            );
         }
     }
 }
