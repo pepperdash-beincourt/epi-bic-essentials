@@ -24,4 +24,10 @@ jobs:
       tag: ${{ needs.getVersion.outputs.tag }}
       channel: ${{ needs.getVersion.outputs.channel }}
       bypassPackageCheck: true
+      # Requires the ESSENTIALSDEVTOOLSVERSION repo variable (Settings > Secrets and variables >
+      # Actions > Variables) to be set to a real PepperDash/essentials-devtools release tag, e.g.
+      # "v1.5.0". Forks don't inherit repo variables from upstream, so this is empty by default on a
+      # fresh fork - when empty, the reusable workflow silently skips both downloading AND embedding
+      # the devtools SPA (no error), which shows up at runtime as https://<processor>/cws/debug 404ing
+      # while the rest of the Essentials Web API works fine.
       devToolsVersion: ${{ vars.ESSENTIALSDEVTOOLSVERSION }}
