@@ -28,9 +28,9 @@
     {"name": "development", "prerelease": "beta", "channel": "beta"},
     {"name": "release", "prerelease": "rc", "channel": "rc"},
     {
-      "name": "replace-me-feature-branch",
-      "prerelease": "replace-me-prerelease",
-      "channel": "replace-me-prerelease"
+      "name": "csv-sandbox-essentials",
+      "prerelease": "csv-sandbox-essentials",
+      "channel": "csv-sandbox-essentials"
     }
   ]
 }
