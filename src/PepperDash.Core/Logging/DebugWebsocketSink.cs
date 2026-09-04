@@ -63,8 +63,15 @@ public class DebugWebsocketSink : ILogEventSink, IKeyed
             if (service == null) return "";
 
             // Use CSLAN IP if available, otherwise fallback to primary IP. This ensures we provide a reachable URL in dual-stack environments.
-            if (!string.IsNullOrEmpty(CrestronEthernetHelper.GetEthernetParameter(CrestronEthernetHelper.ETHERNET_PARAMETER_TO_GET.GET_CURRENT_IP_ADDRESS, 1)))
-                return $"wss://{CrestronEthernetHelper.GetEthernetParameter(CrestronEthernetHelper.ETHERNET_PARAMETER_TO_GET.GET_CURRENT_IP_ADDRESS, 1)}:{_httpsServer.Port}{service.Path}";
+            // On hardware with no second (CS-LAN) Ethernet adapter, GetEthernetParameter for adapter 1
+            // does not return null/empty for GET_CURRENT_IP_ADDRESS - it returns the literal string
+            // "Invalid Value". That string is non-empty, so an IsNullOrEmpty check alone treats it as a
+            // usable address and bakes it straight into the URL, breaking every client trying to connect
+            // (observed: "wss://Invalid Value:<port>/debug/join/"). Validate it actually parses as an IP
+            // before using it, so hardware without a CS-LAN adapter correctly falls back to adapter 0.
+            var cslanIp = CrestronEthernetHelper.GetEthernetParameter(CrestronEthernetHelper.ETHERNET_PARAMETER_TO_GET.GET_CURRENT_IP_ADDRESS, 1);
+            if (System.Net.IPAddress.TryParse(cslanIp, out _))
+                return $"wss://{cslanIp}:{_httpsServer.Port}{service.Path}";
             else
                 return $"wss://{CrestronEthernetHelper.GetEthernetParameter(CrestronEthernetHelper.ETHERNET_PARAMETER_TO_GET.GET_CURRENT_IP_ADDRESS, 0)}:{_httpsServer.Port}{service.Path}";
         }
