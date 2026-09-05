@@ -135,7 +135,15 @@ namespace PepperDash.Essentials.WebSocketServer
         {
             get
             {
-                return string.Format("http://{0}:{1}{2}?token=",
+                // The server itself only listens for TLS when DirectServer.Secure is set (see
+                // Initialize()'s sslConfig setup above) - this must follow that same flag rather
+                // than hardcoding http, or a secure server hands out a URL its own touchpanel
+                // clients embed in an HTTPS-hosted iframe, where it gets silently dropped as
+                // mixed content instead of ever loading.
+                var scheme = _parent.Config.DirectServer.Secure ? "https" : "http";
+
+                return string.Format("{0}://{1}:{2}{3}?token=",
+                    scheme,
                     CrestronEthernetHelper.GetEthernetParameter(CrestronEthernetHelper.ETHERNET_PARAMETER_TO_GET.GET_CURRENT_IP_ADDRESS, 0),
                     Port,
                     _userAppBaseHref);
@@ -403,11 +411,17 @@ namespace PepperDash.Essentials.WebSocketServer
                     ip = csIpAddress.ToString();
                 }
 
-                var appUrl = $"http://{ip}:{_parent.Config.DirectServer.Port}/mc/app/?token={touchpanel.Key}";
+                // Must follow DirectServer.Secure like the server's own Initialize() does (see
+                // UserAppUrlPrefix above for the same fix) - a secure server handing out an http
+                // URL gets embedded in the touchpanel wrapper app's HTTPS-hosted iframe, where
+                // it's silently dropped as mixed content instead of ever loading.
+                var scheme = _parent.Config.DirectServer.Secure ? "https" : "http";
+
+                var appUrl = $"{scheme}://{ip}:{_parent.Config.DirectServer.Port}/mc/app/?token={touchpanel.Key}";
 
                 this.LogVerbose("Sending URL {appUrl} to touchpanel {touchpanelKey}", appUrl, touchpanel.Touchpanel.Key);
 
-                touchpanel.Touchpanel.SetAppUrl($"http://{ip}:{_parent.Config.DirectServer.Port}/mc/app/?token={touchpanel.Key}");
+                touchpanel.Touchpanel.SetAppUrl(appUrl);
             }
         }
 
@@ -592,9 +606,13 @@ namespace PepperDash.Essentials.WebSocketServer
         {
             try
             {
+                // Must follow DirectServer.Secure like the server's own Initialize() does - see
+                // UserAppUrlPrefix for the same fix.
+                var scheme = _parent.Config.DirectServer.Secure ? "https" : "http";
+
                 var config = new MobileControlApplicationConfig
                 {
-                    ApiPath = string.Format("http://{0}:{1}/mc/api", processorIp, _parent.Config.DirectServer.Port),
+                    ApiPath = string.Format("{0}://{1}:{2}/mc/api", scheme, processorIp, _parent.Config.DirectServer.Port),
                     GatewayAppPath = "",
                     LogoPath = _parent.Config.ApplicationConfig?.LogoPath ?? "logo/logo.png",
                     EnableDev = _parent.Config.ApplicationConfig?.EnableDev ?? false,
@@ -1321,8 +1339,13 @@ namespace PepperDash.Essentials.WebSocketServer
 
             this.LogVerbose("Assigning ClientId: {clientId} for token: {token} at {timestamp}", clientId, token, now);
 
-            // Construct WebSocket URL with clientId query parameter
-            var wsProtocol = "ws";
+            // Construct WebSocket URL with clientId query parameter. Both this and UserAppUrl
+            // below must follow DirectServer.Secure like the server's own Initialize() does (see
+            // UserAppUrlPrefix and AddClientsForTouchpanels for the same fix) - a secure server
+            // handing out ws:// or http:// URLs breaks clients loaded over https, which refuse
+            // the insecure connection/frame instead of ever completing it.
+            var httpScheme = _parent.Config.DirectServer.Secure ? "https" : "http";
+            var wsProtocol = _parent.Config.DirectServer.Secure ? "wss" : "ws";
             var wsUrl = $"{wsProtocol}://{CrestronEthernetHelper.GetEthernetParameter(CrestronEthernetHelper.ETHERNET_PARAMETER_TO_GET.GET_CURRENT_IP_ADDRESS, 0)}:{Port}{_wsPath}{token}?clientId={clientId}";
 
             // Construct the response object
@@ -1335,7 +1358,8 @@ namespace PepperDash.Essentials.WebSocketServer
                 Config = _parent.GetConfigWithPluginVersion(),
                 CodeExpires = new DateTime().AddYears(1),
                 UserCode = bridge.UserCode,
-                UserAppUrl = string.Format("http://{0}:{1}/mc/app/",
+                UserAppUrl = string.Format("{0}://{1}:{2}/mc/app/",
+                httpScheme,
                 CrestronEthernetHelper.GetEthernetParameter(CrestronEthernetHelper.ETHERNET_PARAMETER_TO_GET.GET_CURRENT_IP_ADDRESS, 0),
                 Port),
                 WebSocketUrl = wsUrl,
