@@ -1277,6 +1277,21 @@ namespace PepperDash.Essentials.WebSocketServer
 
             this.LogVerbose("Join Room Request with token: {token}", token);
 
+            // This endpoint hands out a fresh, one-time-use clientId on every call (see
+            // Utilities.GetNextClientId() below) - the client is expected to re-hit it on every
+            // reconnect. With no cache-prevention headers, a Chromium-based embedded WebView (the
+            // touchpanel wrapper app's runtime) can serve a cached response for the identical
+            // ?token=... URL instead of ever reaching the server again, replaying the same
+            // already-consumed clientId forever: RegisterUiClient's pendingClientRegistrations
+            // .TryRemove rejects it every time as "unregistered or expired", the client closes and
+            // retries in 5s (see the react-app-core websocket middleware's reconnect timer), and it
+            // never recovers on its own (#confirmed via live testing - a touchpanel got stuck
+            // replaying the same rejected clientId indefinitely). Mark every response from this
+            // handler explicitly non-cacheable so that can never happen.
+            res.AddHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+            res.AddHeader("Pragma", "no-cache");
+            res.AddHeader("Expires", "0");
+
             byte[] body;
 
             if (string.IsNullOrEmpty(token) || !UiClientContexts.TryGetValue(token, out UiClientContext clientContext))
