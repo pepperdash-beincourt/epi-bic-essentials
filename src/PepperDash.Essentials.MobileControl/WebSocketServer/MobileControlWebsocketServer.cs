@@ -7,6 +7,7 @@ using System.IO.Compression;
 using System.Linq;
 using System.Net.Http;
 using System.Security.Authentication;
+using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -161,6 +162,22 @@ namespace PepperDash.Essentials.WebSocketServer
 
             }
         }
+
+        /// <summary>
+        /// Short fingerprint of the user app bundle currently deployed in mcUserApp, or an empty
+        /// string when no bundle is deployed. Recomputed on every startup after the deploy step.
+        /// </summary>
+        /// <remarks>
+        /// Appended to the app URL handed to touchpanels (see AddClientsForTouchpanels). The
+        /// touchpanel wrapper app reloads its iframe whenever the URL string on join 1 changes and
+        /// never otherwise, so a running panel only picked up a new react-app build when someone
+        /// pulsed ReloadIframe from the console. Stamping the URL with the bundle fingerprint makes
+        /// that reload happen exactly when a new bundle is deployed: online panels reload as soon as
+        /// the program starts with it, offline panels get the new URL when they next come online, and
+        /// a restart without a new bundle changes nothing. index.html is the fingerprint source
+        /// because Vite rewrites it with new content-hashed asset names on every build.
+        /// </remarks>
+        public string UserAppBundleStamp { get; private set; } = string.Empty;
 
         /// <summary>
         /// Gets the count of connected UI clients
@@ -428,7 +445,13 @@ namespace PepperDash.Essentials.WebSocketServer
                 // it's silently dropped as mixed content instead of ever loading.
                 var scheme = _parent.Config.DirectServer.Secure ? "https" : "http";
 
-                var appUrl = $"{scheme}://{ip}:{_parent.Config.DirectServer.Port}/mc/app/?token={touchpanel.Key}";
+                // The bundle stamp goes after the token: every consumer of this URL parses the query
+                // properly (HandleJoinRequest via req.QueryString, the react app core via
+                // URLSearchParams, the wrapper app via URL), and the panel controller's IP rewrite only
+                // touches the host. See UserAppBundleStamp for why it is here at all.
+                var bundleQuery = string.IsNullOrEmpty(UserAppBundleStamp) ? string.Empty : $"&bundle={UserAppBundleStamp}";
+
+                var appUrl = $"{scheme}://{ip}:{_parent.Config.DirectServer.Port}/mc/app/?token={touchpanel.Key}{bundleQuery}";
 
                 this.LogVerbose("Sending URL {appUrl} to touchpanel {touchpanelKey}", appUrl, touchpanel.Touchpanel.Key);
 
@@ -454,6 +477,8 @@ namespace PepperDash.Essentials.WebSocketServer
             }
 
             DeployMcUserAppZipIfPresent();
+
+            UpdateUserAppBundleStamp();
 
             if (!Directory.Exists($"{userAppPath}{localConfigFolderName}"))
             {
@@ -505,6 +530,42 @@ namespace PepperDash.Essentials.WebSocketServer
                 var contents = JsonConvert.SerializeObject(config, Formatting.Indented);
 
                 sw.Write(contents);
+            }
+        }
+
+        /// <summary>
+        /// Recomputes UserAppBundleStamp from the deployed user app's index.html. Must run after
+        /// DeployMcUserAppZipIfPresent and before AddClientsForTouchpanels builds any app URL.
+        /// </summary>
+        private void UpdateUserAppBundleStamp()
+        {
+            var indexPath = $"{userAppPath}index.html";
+
+            try
+            {
+                if (!File.Exists(indexPath))
+                {
+                    UserAppBundleStamp = string.Empty;
+                    this.LogWarning("No user app index.html at {indexPath}; touchpanel app URLs will carry no bundle stamp", indexPath);
+                    return;
+                }
+
+                using (var sha = SHA256.Create())
+                using (var stream = File.OpenRead(indexPath))
+                {
+                    var hash = sha.ComputeHash(stream);
+
+                    // 5 bytes = 10 hex characters: plenty to distinguish builds, short enough to read in a log.
+                    UserAppBundleStamp = BitConverter.ToString(hash, 0, 5).Replace("-", string.Empty).ToLowerInvariant();
+                }
+
+                this.LogInformation("User app bundle stamp {stamp}", UserAppBundleStamp);
+            }
+            catch (Exception ex)
+            {
+                UserAppBundleStamp = string.Empty;
+                this.LogError("Error computing user app bundle stamp from {indexPath}: {message}", indexPath, ex.Message);
+                this.LogDebug(ex, "Stack Trace");
             }
         }
 
