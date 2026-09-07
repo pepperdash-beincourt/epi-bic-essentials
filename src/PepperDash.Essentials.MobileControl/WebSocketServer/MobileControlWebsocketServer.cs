@@ -9,6 +9,7 @@ using System.Net.Http;
 using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using System.Text.RegularExpressions;
 using Crestron.SimplSharp;
 using Crestron.SimplSharp.WebScripting;
 using Newtonsoft.Json;
@@ -77,16 +78,14 @@ namespace PepperDash.Essentials.WebSocketServer
         private readonly ConcurrentDictionary<string, ConcurrentBag<(string clientId, DateTime timestamp)>> legacyClientRegistrations = new ConcurrentDictionary<string, ConcurrentBag<(string, DateTime)>>();
 
         /// <summary>
-        /// Consecutive RegisterUiClient failures per token. A client's own reconnect loop only ever
-        /// asks the server for a websocket connection - it has no way to force its own page to
-        /// reload, so a client stuck replaying an already-consumed/unrecognized clientId (confirmed
-        /// via live testing: a touchpanel's WebView can keep running for hours across any number of
-        /// server-side restarts, since restarting Essentials never touches the panel's own page) has
-        /// no path to recover on its own. Reset to 0 on a successful registration for that token.
+        /// Vite emits content-hashed bundles as assets/&lt;name&gt;-&lt;hash&gt;.&lt;ext&gt;; any change to
+        /// their content produces a new filename, so those are safe to cache indefinitely. Everything
+        /// else the user app requests by a fixed path (index.html, the app config JSON, icons and
+        /// logos) must never be stored by a client - see HandleUserAppRequest.
         /// </summary>
-        private readonly ConcurrentDictionary<string, int> consecutiveRegistrationFailures = new ConcurrentDictionary<string, int>();
-
-        private const int RegistrationFailuresBeforeReload = 3;
+        private static readonly Regex HashedAssetPattern = new Regex(
+            @"[\\/]assets[\\/][^\\/]+-[A-Za-z0-9_-]{6,}\.(js|css|woff2?|ttf|png|jpe?g|svg|webp)$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         /// <summary>
         /// Gets the collection of UI clients
@@ -942,7 +941,6 @@ namespace PepperDash.Essentials.WebSocketServer
             if (!pendingClientRegistrations.TryRemove(registrationKey, out _))
             {
                 this.LogWarning("Client attempted to connect with unregistered or expired clientId {clientId} for token {token}", clientId, tokenKey);
-                HandleRegistrationFailure(tokenKey);
                 return false;
             }
 
@@ -953,49 +951,8 @@ namespace PepperDash.Essentials.WebSocketServer
                 return client;
             });
 
-            consecutiveRegistrationFailures.TryRemove(tokenKey, out _);
-
             this.LogInformation("Successfully registered UiClient with ID {clientId} for token {token}", clientId, tokenKey);
             return true;
-        }
-
-        /// <summary>
-        /// Counts consecutive RegisterUiClient failures for a token and, once
-        /// RegistrationFailuresBeforeReload is reached, forces a reload of the associated
-        /// touchpanel's iframe rather than continuing to let it silently retry forever. Only applies
-        /// to touchpanel tokens (JoinToken.TouchpanelKey set) - a personal device/browser client with
-        /// no associated panel is left to its own reconnect logic, since there is nothing here to
-        /// force-reload for it.
-        /// </summary>
-        private void HandleRegistrationFailure(string tokenKey)
-        {
-            var failureCount = consecutiveRegistrationFailures.AddOrUpdate(tokenKey, 1, (_, count) => count + 1);
-
-            if (failureCount < RegistrationFailuresBeforeReload)
-            {
-                return;
-            }
-
-            consecutiveRegistrationFailures.TryRemove(tokenKey, out _);
-
-            if (!UiClientContexts.TryGetValue(tokenKey, out var context) || string.IsNullOrEmpty(context.Token?.TouchpanelKey))
-            {
-                return;
-            }
-
-            var touchpanelKey = context.Token.TouchpanelKey;
-            var touchpanel = DeviceManager.AllDevices
-                .OfType<IMobileControlCrestronTouchpanelController>()
-                .FirstOrDefault(tp => tp.Key.Equals(touchpanelKey, StringComparison.InvariantCultureIgnoreCase));
-
-            if (touchpanel == null)
-            {
-                this.LogWarning("Touchpanel '{touchpanelKey}' stuck retrying an unrecognized clientId {failureCount} times in a row, but no matching touchpanel device was found to reload", touchpanelKey, failureCount);
-                return;
-            }
-
-            this.LogWarning("Touchpanel '{touchpanelKey}' failed to register {failureCount} times in a row for token {token} - forcing an iframe reload since its own reconnect loop cannot recover from this on its own", touchpanelKey, failureCount, tokenKey);
-            touchpanel.ReloadIframe();
         }
 
         /// <summary>
@@ -1333,15 +1290,15 @@ namespace PepperDash.Essentials.WebSocketServer
 
             // This endpoint hands out a fresh, one-time-use clientId on every call (see
             // Utilities.GetNextClientId() below) - the client is expected to re-hit it on every
-            // reconnect. With no cache-prevention headers, a Chromium-based embedded WebView (the
-            // touchpanel wrapper app's runtime) can serve a cached response for the identical
-            // ?token=... URL instead of ever reaching the server again, replaying the same
-            // already-consumed clientId forever: RegisterUiClient's pendingClientRegistrations
-            // .TryRemove rejects it every time as "unregistered or expired", the client closes and
-            // retries in 5s (see the react-app-core websocket middleware's reconnect timer), and it
-            // never recovers on its own (#confirmed via live testing - a touchpanel got stuck
-            // replaying the same rejected clientId indefinitely). Mark every response from this
-            // handler explicitly non-cacheable so that can never happen.
+            // reconnect. The touchpanel wrapper app's embedded WebView has been observed serving a
+            // stored response for a fixed URL indefinitely, without contacting the server again:
+            // it replayed a clientId from an earlier server session on every reconnect, which
+            // RegisterUiClient correctly rejected as unregistered, forever (confirmed via live
+            // testing - the value survived program restarts and a panel power cycle, and only a
+            // never-seen URL, i.e. a rotated token, broke the loop). no-store here keeps the
+            // response from being stored in the first place; it cannot evict an entry a client
+            // stored before this header existed, so a client already stuck needs its token
+            // rotated (MobileRemoveUiClient <token>, then restart) to escape.
             res.AddHeader("Cache-Control", "no-store, no-cache, must-revalidate");
             res.AddHeader("Pragma", "no-cache");
             res.AddHeader("Expires", "0");
@@ -1630,10 +1587,27 @@ namespace PepperDash.Essentials.WebSocketServer
             else
             {
                 this.LogWarning("File not found: {filePath}", filePath);
+
+                // A miss must never be storable. On every program restart there is a window where
+                // this server is already listening but mcUserApp has not been re-extracted yet, so a
+                // client loading during it gets an empty 404 for every asset it asks for. A
+                // cache-preferring embedded WebView (the touchpanel wrapper app's runtime) then
+                // serves those stored empties for the same URLs indefinitely - confirmed via live
+                // testing: a panel that reloaded through a restart came up with every icon blank
+                // and stayed that way across power cycles. Same applies to any transient miss.
+                res.AddHeader("Cache-Control", "no-store");
                 res.StatusCode = (int)HttpStatusCode.NotFound;
                 res.Close();
                 return;
             }
+
+            // Content-hashed bundles change name whenever their content changes, so they can be
+            // cached indefinitely. Everything requested by a fixed path (index.html, the app config
+            // JSON, icons/logos) must not be stored at all - for the same client behavior described
+            // above, a stored copy would otherwise mask every future build and config change.
+            res.AddHeader("Cache-Control", HashedAssetPattern.IsMatch(filePath)
+                ? "public, max-age=31536000, immutable"
+                : "no-store");
 
             res.ContentLength64 = contents.LongLength;
             try
