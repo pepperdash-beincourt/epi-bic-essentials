@@ -1446,19 +1446,19 @@ namespace PepperDash.Essentials.WebSocketServer
             {
                 if (filePath.EndsWith(".png"))
                 {
-                    res.ContentType = "image/png";
+                    SetImageContentType(res, "image/png");
                 }
                 else if (filePath.EndsWith(".jpg"))
                 {
-                    res.ContentType = "image/jpeg";
+                    SetImageContentType(res, "image/jpeg");
                 }
                 else if (filePath.EndsWith(".gif"))
                 {
-                    res.ContentType = "image/gif";
+                    SetImageContentType(res, "image/gif");
                 }
                 else if (filePath.EndsWith(".svg"))
                 {
-                    res.ContentType = "image/svg+xml";
+                    SetImageContentType(res, "image/svg+xml");
                 }
                 byte[] contents = File.ReadAllBytes(filePath);
                 res.ContentLength64 = contents.LongLength;
@@ -1478,6 +1478,25 @@ namespace PepperDash.Essentials.WebSocketServer
                 res.StatusCode = (int)HttpStatusCode.NotFound;
                 res.Close();
             }
+        }
+
+        /// <summary>
+        /// Sets an image content type with no charset parameter.
+        /// </summary>
+        /// <remarks>
+        /// Server_OnGet defaults ContentEncoding to UTF-8, and websocket-sharp then emits
+        /// "Content-Type: image/svg+xml; charset=utf-8". Crestron's CH5 touchpanel host intercepts
+        /// every http image request itself and hands the WebView that raw header value as the
+        /// response's MIME type, unparsed. Chromium sniffs raster formats regardless of the declared
+        /// type, but only decodes a response as SVG when the MIME type is exactly "image/svg+xml" -
+        /// so with the parameter attached every served SVG failed to render on a TS-1070
+        /// (fw 3.003.0021, WebView 118) while PNGs survived; the same bytes typed bare rendered fine.
+        /// Verified 2026-09-07. A charset is meaningless on a binary type in any case.
+        /// </remarks>
+        private static void SetImageContentType(HttpListenerResponse res, string mimeType)
+        {
+            res.ContentType = mimeType;
+            res.ContentEncoding = null;
         }
 
         /// <summary>
@@ -1545,27 +1564,27 @@ namespace PepperDash.Essentials.WebSocketServer
             }
             else if (filePath.EndsWith(".svg"))
             {
-                res.ContentType = "image/svg+xml";
+                SetImageContentType(res, "image/svg+xml");
             }
             else if (filePath.EndsWith(".png"))
             {
-                res.ContentType = "image/png";
+                SetImageContentType(res, "image/png");
             }
             else if (filePath.EndsWith(".jpg") || filePath.EndsWith(".jpeg"))
             {
-                res.ContentType = "image/jpeg";
+                SetImageContentType(res, "image/jpeg");
             }
             else if (filePath.EndsWith(".gif"))
             {
-                res.ContentType = "image/gif";
+                SetImageContentType(res, "image/gif");
             }
             else if (filePath.EndsWith(".webp"))
             {
-                res.ContentType = "image/webp";
+                SetImageContentType(res, "image/webp");
             }
             else if (filePath.EndsWith(".ico"))
             {
-                res.ContentType = "image/x-icon";
+                SetImageContentType(res, "image/x-icon");
             }
 
             this.LogVerbose("Attempting to serve file: {filePath}", filePath);
@@ -1590,11 +1609,11 @@ namespace PepperDash.Essentials.WebSocketServer
 
                 // A miss must never be storable. On every program restart there is a window where
                 // this server is already listening but mcUserApp has not been re-extracted yet, so a
-                // client loading during it gets an empty 404 for every asset it asks for. A
-                // cache-preferring embedded WebView (the touchpanel wrapper app's runtime) then
-                // serves those stored empties for the same URLs indefinitely - confirmed via live
-                // testing: a panel that reloaded through a restart came up with every icon blank
-                // and stayed that way across power cycles. Same applies to any transient miss.
+                // client loading during it gets an empty 404 for every asset it asks for. The
+                // touchpanel wrapper app's WebView has been observed serving a stored response for a
+                // fixed URL indefinitely (the /joinroom case, confirmed via live testing), so a
+                // stored 404 would mask the asset until its URL changed. Same applies to any
+                // transient miss.
                 res.AddHeader("Cache-Control", "no-store");
                 res.StatusCode = (int)HttpStatusCode.NotFound;
                 res.Close();
