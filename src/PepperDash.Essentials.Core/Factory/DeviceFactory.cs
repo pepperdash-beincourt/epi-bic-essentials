@@ -109,6 +109,27 @@ public class DeviceFactory
         new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
+    /// Assemblies whose factories have built at least one device or room from the running
+    /// configuration. Every loaded plugin registers its types, but only some are configured on a
+    /// given system; this is what lets a plugin be reported as in use (see LoadedAssembly.InUse).
+    /// </summary>
+    private static readonly HashSet<Assembly> AssembliesInUse = [];
+
+    /// <summary>
+    /// Returns true if a device or room from the running configuration was built by a factory
+    /// declared in <paramref name="assembly"/>.
+    /// </summary>
+    public static bool IsAssemblyInUse(Assembly assembly)
+    {
+        if (assembly == null) return false;
+
+        lock (AssembliesInUse)
+        {
+            return AssembliesInUse.Contains(assembly);
+        }
+    }
+
+    /// <summary>
     /// Registers a factory method for creating instances of a specific type.
     /// </summary>
     /// <remarks>This method associates a type name with a factory method, allowing instances of the type to
@@ -212,7 +233,17 @@ public class DeviceFactory
             Debug.LogInformation("Loading '{type}' from {assemblyName}", typeName, wrapper.Type.Assembly.FullName);
 
             // Check for types that have been added by plugin dlls.
-            return wrapper.FactoryMethod(localDc);
+            var device = wrapper.FactoryMethod(localDc);
+
+            if (device != null && wrapper.Type != null)
+            {
+                lock (AssembliesInUse)
+                {
+                    AssembliesInUse.Add(wrapper.Type.Assembly);
+                }
+            }
+
+            return device;
         }
         catch (Exception ex)
         {
