@@ -13,5 +13,10 @@ namespace PepperDash.Essentials.Core.DeviceTypeInterfaces
     /// Gets a collection of connected IP information for the touchpanel controller
     /// </summary>
     ReadOnlyCollection<ConnectedIpInformation> ConnectedIps { get; }
+
+    /// <summary>
+    /// Force a reload of the iframe on the panel connected to this IP ID
+    /// </summary>
+    void ReloadIframe();
   }
 }

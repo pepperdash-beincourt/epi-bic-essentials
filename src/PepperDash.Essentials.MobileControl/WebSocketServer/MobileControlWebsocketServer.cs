@@ -77,6 +77,18 @@ namespace PepperDash.Essentials.WebSocketServer
         private readonly ConcurrentDictionary<string, ConcurrentBag<(string clientId, DateTime timestamp)>> legacyClientRegistrations = new ConcurrentDictionary<string, ConcurrentBag<(string, DateTime)>>();
 
         /// <summary>
+        /// Consecutive RegisterUiClient failures per token. A client's own reconnect loop only ever
+        /// asks the server for a websocket connection - it has no way to force its own page to
+        /// reload, so a client stuck replaying an already-consumed/unrecognized clientId (confirmed
+        /// via live testing: a touchpanel's WebView can keep running for hours across any number of
+        /// server-side restarts, since restarting Essentials never touches the panel's own page) has
+        /// no path to recover on its own. Reset to 0 on a successful registration for that token.
+        /// </summary>
+        private readonly ConcurrentDictionary<string, int> consecutiveRegistrationFailures = new ConcurrentDictionary<string, int>();
+
+        private const int RegistrationFailuresBeforeReload = 3;
+
+        /// <summary>
         /// Gets the collection of UI clients
         /// </summary>
         public IReadOnlyDictionary<string, UiClient> UiClients => uiClients;
@@ -930,6 +942,7 @@ namespace PepperDash.Essentials.WebSocketServer
             if (!pendingClientRegistrations.TryRemove(registrationKey, out _))
             {
                 this.LogWarning("Client attempted to connect with unregistered or expired clientId {clientId} for token {token}", clientId, tokenKey);
+                HandleRegistrationFailure(tokenKey);
                 return false;
             }
 
@@ -940,8 +953,49 @@ namespace PepperDash.Essentials.WebSocketServer
                 return client;
             });
 
+            consecutiveRegistrationFailures.TryRemove(tokenKey, out _);
+
             this.LogInformation("Successfully registered UiClient with ID {clientId} for token {token}", clientId, tokenKey);
             return true;
+        }
+
+        /// <summary>
+        /// Counts consecutive RegisterUiClient failures for a token and, once
+        /// RegistrationFailuresBeforeReload is reached, forces a reload of the associated
+        /// touchpanel's iframe rather than continuing to let it silently retry forever. Only applies
+        /// to touchpanel tokens (JoinToken.TouchpanelKey set) - a personal device/browser client with
+        /// no associated panel is left to its own reconnect logic, since there is nothing here to
+        /// force-reload for it.
+        /// </summary>
+        private void HandleRegistrationFailure(string tokenKey)
+        {
+            var failureCount = consecutiveRegistrationFailures.AddOrUpdate(tokenKey, 1, (_, count) => count + 1);
+
+            if (failureCount < RegistrationFailuresBeforeReload)
+            {
+                return;
+            }
+
+            consecutiveRegistrationFailures.TryRemove(tokenKey, out _);
+
+            if (!UiClientContexts.TryGetValue(tokenKey, out var context) || string.IsNullOrEmpty(context.Token?.TouchpanelKey))
+            {
+                return;
+            }
+
+            var touchpanelKey = context.Token.TouchpanelKey;
+            var touchpanel = DeviceManager.AllDevices
+                .OfType<IMobileControlCrestronTouchpanelController>()
+                .FirstOrDefault(tp => tp.Key.Equals(touchpanelKey, StringComparison.InvariantCultureIgnoreCase));
+
+            if (touchpanel == null)
+            {
+                this.LogWarning("Touchpanel '{touchpanelKey}' stuck retrying an unrecognized clientId {failureCount} times in a row, but no matching touchpanel device was found to reload", touchpanelKey, failureCount);
+                return;
+            }
+
+            this.LogWarning("Touchpanel '{touchpanelKey}' failed to register {failureCount} times in a row for token {token} - forcing an iframe reload since its own reconnect loop cannot recover from this on its own", touchpanelKey, failureCount, tokenKey);
+            touchpanel.ReloadIframe();
         }
 
         /// <summary>
