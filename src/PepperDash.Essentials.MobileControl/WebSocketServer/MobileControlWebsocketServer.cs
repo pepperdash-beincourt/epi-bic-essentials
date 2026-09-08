@@ -1723,12 +1723,7 @@ namespace PepperDash.Essentials.WebSocketServer
         {
             foreach (var client in uiClients.Values)
             {
-                if (!client.Context.WebSocket.IsAlive)
-                {
-                    continue;
-                }
-
-                client.Context.WebSocket.Send(message);
+                TrySend(client.Id, client.Context.WebSocket, message);
             }
         }
 
@@ -1749,18 +1744,42 @@ namespace PepperDash.Essentials.WebSocketServer
 
             if (uiClients.TryGetValue((string)clientId, out var client))
             {
-                var socket = client.Context.WebSocket;
-
-                if (!socket.IsAlive)
-                {
-                    this.LogError("Unable to send message to client {id}. Client is disconnected: {message}", clientId, message);
-                    return;
-                }
-                socket.Send(message);
+                TrySend(client.Id, client.Context.WebSocket, message);
             }
             else
             {
                 this.LogWarning("Unable to find client with ID: {clientId}", clientId);
+            }
+        }
+
+        /// <summary>
+        /// Sends on an open socket, dropping the message only when the socket is genuinely not open.
+        /// </summary>
+        /// <remarks>
+        /// This used to gate on WebSocket.IsAlive, which in websocket-sharp is not a status flag: it
+        /// sends a ping and returns false unless the pong arrives within about a second. A browser busy
+        /// re-rendering (the In Session page right after Begin Session, for instance) can miss that
+        /// window on a perfectly good connection, so the server logged "Client is disconnected" and
+        /// silently dropped the very state message the client was waiting for - seen live at Reston:
+        /// the room entered In Session while the UI fell back to the Lobby. ReadyState reflects the
+        /// real connection state; a socket that has actually died raises OnClose, and a send that
+        /// fails anyway is logged rather than pre-empted by a ping.
+        /// </remarks>
+        private void TrySend(string clientId, WebSocket socket, string message)
+        {
+            if (socket == null || socket.ReadyState != WebSocketState.Open)
+            {
+                this.LogWarning("Unable to send message to client {id}: socket state is {state}", clientId, socket?.ReadyState);
+                return;
+            }
+
+            try
+            {
+                socket.Send(message);
+            }
+            catch (Exception ex)
+            {
+                this.LogWarning("Send to client {id} failed: {message}", clientId, ex.Message);
             }
         }
     }
