@@ -18,6 +18,10 @@ public static class DevToolsBranding
 {
     private const string ScriptFileName = "brand.js";
     private const string ScriptResourceName = "branding.js";
+    private const string StyleFileName = "brand.css";
+    private const string StyleResourceName = "branding.css";
+    private const string StyleTagMarker = "id=\"brand-style\"";
+    private const string StyleTag = "<link " + StyleTagMarker + " rel=\"stylesheet\" href=\"/cws/debug/" + StyleFileName + "\">";
     private const string LogoFileName = "brand-logo";
     private const string LogoFolderName = "logo";
     private const string BrandedDocumentTitle = "<title>Beincourt Essentials Dev Tools</title>";
@@ -50,7 +54,8 @@ public static class DevToolsBranding
                 return;
             }
 
-            WriteScript(Path.Combine(debugDirectory, ScriptFileName));
+            WriteResource(ScriptResourceName, Path.Combine(debugDirectory, ScriptFileName));
+            WriteResource(StyleResourceName, Path.Combine(debugDirectory, StyleFileName));
 
             var logoFileName = CopyLogo(debugDirectory, programDirectory);
 
@@ -63,7 +68,13 @@ public static class DevToolsBranding
             // Replace an earlier branding tag rather than stacking a second one, so re-extracting a
             // dev tools release (or a changed logo) stays idempotent.
             html = Regex.Replace(html, $"[ \t]*<script {Regex.Escape(ScriptTagMarker)}.*?</script>\r?\n?", string.Empty);
+            html = Regex.Replace(html, $"[ \t]*<link {Regex.Escape(StyleTagMarker)}.*?>\r?\n?", string.Empty);
             html = Regex.Replace(html, "<title>.*?</title>", BrandedDocumentTitle);
+
+            var headClose = html.IndexOf("</head>", StringComparison.OrdinalIgnoreCase);
+            html = headClose < 0
+                ? StyleTag + html
+                : html.Insert(headClose, "  " + StyleTag + Environment.NewLine + "  ");
 
             var bodyClose = html.LastIndexOf("</body>", StringComparison.OrdinalIgnoreCase);
             html = bodyClose < 0
@@ -121,17 +132,17 @@ public static class DevToolsBranding
         return destinationFileName;
     }
 
-    private static void WriteScript(string destinationPath)
+    private static void WriteResource(string resourceFileName, string destinationPath)
     {
         var assembly = Assembly.GetExecutingAssembly();
         var resourceName = assembly
             .GetManifestResourceNames()
-            .FirstOrDefault(name => name.EndsWith("." + ScriptResourceName, StringComparison.OrdinalIgnoreCase));
+            .FirstOrDefault(name => name.EndsWith("." + resourceFileName, StringComparison.OrdinalIgnoreCase));
 
         if (resourceName == null)
         {
             Debug.LogMessage(LogEventLevel.Warning,
-                "Branding resource {resourceFileName:l} not found in the assembly", ScriptResourceName);
+                "Branding resource {resourceFileName:l} not found in the assembly", resourceFileName);
             return;
         }
 

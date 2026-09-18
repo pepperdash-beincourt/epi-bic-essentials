@@ -1,0 +1,39 @@
+/* Dark mode for the Essentials dev tools app. The app ships Bootstrap 5.3, whose own dark theme is
+   switched on by data-bs-theme="dark" (set in brand.js), so almost everything follows from its
+   tokens. These rules only cover the app's own light-mode colours, which are hard-coded and so do
+   not follow the theme, plus a true black page as asked for. */
+:root[data-bs-theme="dark"] {
+  --bs-body-bg: #000;
+  --bs-body-bg-rgb: 0, 0, 0;
+}
+
+:root[data-bs-theme="dark"] body,
+:root[data-bs-theme="dark"] #root {
+  background-color: var(--bs-body-bg);
+  color: var(--bs-body-color);
+}
+
+/* .bg-body is redefined by the app as a fixed light blue-grey */
+:root[data-bs-theme="dark"] .bg-body {
+  background-color: var(--bs-body-bg) !important;
+}
+
+:root[data-bs-theme="dark"] .bg-white,
+:root[data-bs-theme="dark"] .bg-light,
+:root[data-bs-theme="dark"] .bg-very-light {
+  background-color: var(--bs-secondary-bg) !important;
+  color: var(--bs-body-color);
+}
+
+:root[data-bs-theme="dark"] .bg-sub-table {
+  background-color: var(--bs-tertiary-bg) !important;
+}
+
+/* The routing diagram keeps its own light palette variables */
+:root[data-bs-theme="dark"] .react-flow {
+  --xy-background-color-default: var(--bs-body-bg);
+  --xy-minimap-background-color-default: var(--bs-secondary-bg);
+  --xy-controls-button-background-color-default: var(--bs-secondary-bg);
+  --xy-controls-button-color-default: var(--bs-body-color);
+  --xy-attribution-background-color-default: #0000;
+}

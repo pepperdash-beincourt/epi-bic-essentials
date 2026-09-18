@@ -6,6 +6,7 @@
   var BRAND_TITLE = "Beincourt Essentials Development Tools";
   var LOGO_WIDTH_RATIO = 0.8; // logo width, as a share of the rendered title's width
   var LOGO_ID = "brand-logo";
+  var LOGO_GAP = "32px"; // space between the logo and the heading
   var logoUrl = document.currentScript ? document.currentScript.getAttribute("data-logo") : null;
   var observer = null;
   var scheduled = false;
@@ -42,6 +43,12 @@
   }
 
   function brand() {
+    // Bootstrap 5.3's own dark theme, which the app already ships - see brand.css for the few
+    // colours the app hard-codes outside it.
+    if (document.documentElement.getAttribute("data-bs-theme") !== "dark") {
+      document.documentElement.setAttribute("data-bs-theme", "dark");
+    }
+
     var element = titleElement();
     if (!element || !logoUrl) return;
 
@@ -52,7 +59,7 @@
       logo.src = logoUrl;
       logo.alt = "";
       logo.style.display = "block";
-      logo.style.margin = "0 auto 12px";
+      logo.style.margin = "0 auto " + LOGO_GAP;
       logo.style.height = "auto";
       element.parentNode.insertBefore(logo, element);
     }
