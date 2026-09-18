@@ -218,6 +218,8 @@ internal static class AssetLoader
                         "Extracted: {entry:l} to {Destination}", entry.FullName, destinationPath);
                 }
             }
+
+            Branding.DevToolsBranding.Apply(debugDir, filePathPrefix);
         }
 
         foreach (var file in devToolsZipFiles)
