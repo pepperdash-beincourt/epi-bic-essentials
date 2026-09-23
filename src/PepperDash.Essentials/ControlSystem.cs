@@ -143,7 +143,18 @@ public class ControlSystem : CrestronControlSystem, ILoadConfig, IInitialization
 
             CrestronConsole.AddNewConsoleCommand(PluginLoader.ReportAssemblyVersions, "reportversions", "Reports the versions of the loaded assemblies", ConsoleAccessLevelEnum.AccessOperator);
 
-            CrestronConsole.AddNewConsoleCommand(IsolationPortProbe.Run, "isolationprobe", "Opens a bare TCP listener to test a port's reachability: isolationprobe <port> | stop", ConsoleAccessLevelEnum.AccessOperator);
+            // A diagnostic command must never be able to stop the program from starting: registering
+            // it is the only part of the probe that runs at boot, and if the console refuses the
+            // command the rest of Essentials still has to come up.
+            try
+            {
+                CrestronConsole.AddNewConsoleCommand(s => IsolationPortProbe.Run(s), "isolationprobe",
+                    "TCP listener to test a port: <port> | stop", ConsoleAccessLevelEnum.AccessOperator);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogMessage(ex, "Could not register the isolationprobe console command");
+            }
 
             CrestronConsole.AddNewConsoleCommand(Core.DeviceFactory.GetDeviceFactoryTypes, "gettypes", "Gets the device types that can be built. Accepts a filter string.", ConsoleAccessLevelEnum.AccessOperator);
 
