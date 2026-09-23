@@ -191,6 +191,24 @@ namespace PepperDash.Essentials.WebSocketServer
         }
 
         /// <summary>
+        /// How far above the public port the server's own loopback port sits, when the relay owns the
+        /// public one and no port was configured.
+        /// </summary>
+        private const int RelayLoopbackPortOffset = 5000;
+
+        private CrestronSocketRelay _relay;
+
+        /// <summary>
+        /// The port the server itself listens on. The same as the public port normally; behind the
+        /// relay, a loopback port that only the relay connects to.
+        /// </summary>
+        private int ListenPort => !_parent.Config.DirectServer.UseCrestronSocket
+            ? Port
+            : _parent.Config.DirectServer.RelayLoopbackPort > 0
+                ? _parent.Config.DirectServer.RelayLoopbackPort
+                : Port + RelayLoopbackPortOffset;
+
+        /// <summary>
         /// Whether the processor is running in isolation mode - the console's `isolatenetworks on`.
         /// Read from the firmware's own settings rather than inferred from a call that failed, so the
         /// log can explain what is about to be skipped instead of reporting an error afterwards.
@@ -240,6 +258,14 @@ namespace PepperDash.Essentials.WebSocketServer
                 this.LogInformation(
                     "Isolation mode is on, so the port forward to the CS LAN is not available and is being skipped. " +
                     "Clients reach the direct server on whichever of the processor's addresses is on their own network.");
+
+                if (!parent.Config.DirectServer.UseCrestronSocket)
+                {
+                    this.LogWarning(
+                        "Isolation mode is on and directServer.useCrestronSocket is not set, so port {port} will be refused: " +
+                        "the firewall only admits ports the firmware opened itself. Set it to serve this port through a " +
+                        "Crestron socket instead.", Port);
+                }
             }
             else if (parent.Config.DirectServer.AutomaticallyForwardPortToCSLAN == true)
             {
@@ -330,14 +356,18 @@ namespace PepperDash.Essentials.WebSocketServer
 
             if (IsolationModeIsActive)
             {
-                // Isolation mode firewalls the LAN from the Control Subnet and disables user port
-                // forwarding. Crestron documents programmatic listen ports as still admitted from
-                // the LAN, so a client on the LAN should reach the address above; if it cannot, the
-                // firewall is the thing to prove, not this server.
+                // Isolation mode firewalls the LAN from the Control Subnet, disables user port
+                // forwarding, and admits only the ports the firmware itself opened. Crestron's table
+                // lists "listen ports used by program" among them, but measurement on a CP4N
+                // (2026-09-23) showed that means a socket opened through their socket API: a bare
+                // TCPServer answered from the LAN on the same boot where this server's port was
+                // refused. Hence useCrestronSocket and the relay.
                 this.LogInformation(
-                    "Isolation mode is ACTIVE. Clients on the LAN reach the LAN address above; clients on the " +
-                    "Control Subnet reach the Control Subnet address. Traffic between the two networks is blocked " +
-                    "by the processor, and user port forwarding is unavailable.");
+                    "Isolation mode is ACTIVE. Clients on the Control Subnet reach the Control Subnet address. " +
+                    "The LAN address is reachable only when directServer.useCrestronSocket is set, which serves " +
+                    "the port through a Crestron socket: {useCrestronSocket}. Traffic between the two networks is " +
+                    "blocked by the processor, and user port forwarding is unavailable.",
+                    _parent.Config.DirectServer.UseCrestronSocket);
             }
             else
             {
@@ -419,7 +449,11 @@ namespace PepperDash.Essentials.WebSocketServer
                     };
                 }
 
-                _server = new HttpServer(Port, false);
+                // Behind the relay the server binds loopback only, and the relay owns the public
+                // port: a Crestron socket is the only kind a processor in isolation mode admits.
+                _server = _parent.Config.DirectServer.UseCrestronSocket
+                    ? new HttpServer(System.Net.IPAddress.Loopback, ListenPort, false)
+                    : new HttpServer(Port, false);
                 if (sslConfig != null)
                 {
                     _server.SslConfiguration.ServerCertificate = sslConfig.ServerCertificate;
@@ -448,6 +482,14 @@ namespace PepperDash.Essentials.WebSocketServer
                     this.LogInformation("Mobile Control WebSocket Server listening on port {port}", _server.Port);
 
                     LogReachability();
+                }
+
+                if (_parent.Config.DirectServer.UseCrestronSocket)
+                {
+                    _relay = new CrestronSocketRelay(Key + "-relay", Port, ListenPort,
+                        _parent.Config.DirectServer.MaxRelayConnections);
+
+                    _relay.Start();
                 }
 
                 CrestronEnvironment.ProgramStatusEventHandler += OnProgramStop;
@@ -563,11 +605,26 @@ namespace PepperDash.Essentials.WebSocketServer
             }
         }
 
+        /// <summary>
+        /// The address of whoever made a request. Behind the relay every request arrives from
+        /// loopback, so the address that decides which application config to serve has to come from
+        /// the relay's own record of the connection rather than from the socket.
+        /// </summary>
+        private static System.Net.IPAddress ClientAddress(WebSocketSharp.Net.HttpListenerRequest req)
+        {
+            var remoteEndPoint = req.RemoteEndPoint;
+
+            return CrestronSocketRelay.TryGetClientAddress(remoteEndPoint, out var clientAddress)
+                ? clientAddress
+                : remoteEndPoint.Address;
+        }
+
         private void OnProgramStop(eProgramStatusEventType programEventType)
         {
             switch (programEventType)
             {
                 case eProgramStatusEventType.Stopping:
+                    _relay?.Stop();
                     _server.Stop();
                     break;
             }
@@ -1388,7 +1445,7 @@ namespace PepperDash.Essentials.WebSocketServer
                 res.AddHeader("Access-Control-Allow-Origin", "*");
 
                 var path = req.RawUrl;
-                var ip = req.RemoteEndPoint.Address.ToString();
+                var ip = ClientAddress(req).ToString();
 
                 this.LogVerbose("POST Request received at path: {path} from host {host}", path, ip);
 
@@ -1754,7 +1811,7 @@ namespace PepperDash.Essentials.WebSocketServer
 
             this.LogVerbose("Attempting to serve file: {filePath}", filePath);
 
-            var remoteIp = req.RemoteEndPoint.Address;
+            var remoteIp = ClientAddress(req);
 
             // Check if the request is coming from the CS LAN and if so, send the CS config instead of the LAN config
             if (csSubnetMask != null && csIpAddress != null && remoteIp.IsInSameSubnet(csIpAddress, csSubnetMask) && filePath.Contains(appConfigFileName))

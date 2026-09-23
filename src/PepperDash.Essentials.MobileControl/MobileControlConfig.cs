@@ -79,6 +79,32 @@ namespace PepperDash.Essentials
         public List<string> CSLanUiDeviceKeys { get; set; }
 
         /// <summary>
+        /// Gets or sets UseCrestronSocket
+        /// </summary>
+        /// <remarks>
+        /// Serve the port through a socket opened with Crestron's own API rather than binding it
+        /// directly - see CrestronSocketRelay. Needed on a processor in isolation mode, whose firewall
+        /// only admits ports the firmware opened itself. Off by default: everywhere else, and on any
+        /// processor without a Control Subnet, the direct bind is reachable as it always was.
+        /// </remarks>
+        [JsonProperty("useCrestronSocket")]
+        public bool UseCrestronSocket { get; set; }
+
+        /// <summary>
+        /// Gets or sets RelayLoopbackPort - the port the server itself listens on behind the relay.
+        /// Defaults to the public port plus 5000. Only used when UseCrestronSocket is set.
+        /// </summary>
+        [JsonProperty("relayLoopbackPort")]
+        public int RelayLoopbackPort { get; set; }
+
+        /// <summary>
+        /// Gets or sets MaxRelayConnections - simultaneous connections through the relay, 64 by
+        /// default. A browser opens several at once per page, so this is not one per client.
+        /// </summary>
+        [JsonProperty("maxRelayConnections")]
+        public int MaxRelayConnections { get; set; }
+
+        /// <summary>
         /// Get or set the Secure property
         /// </summary>
         /// <remarks>
