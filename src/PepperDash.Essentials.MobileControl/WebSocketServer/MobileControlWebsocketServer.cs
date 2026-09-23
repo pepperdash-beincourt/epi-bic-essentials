@@ -191,6 +191,28 @@ namespace PepperDash.Essentials.WebSocketServer
         }
 
         /// <summary>
+        /// Whether the processor is running in isolation mode - the console's `isolatenetworks on`.
+        /// Read from the firmware's own settings rather than inferred from a call that failed, so the
+        /// log can explain what is about to be skipped instead of reporting an error afterwards.
+        /// </summary>
+        private static bool IsolationModeIsActive
+        {
+            get
+            {
+                try
+                {
+                    return InitialParametersClass.SystemSettings != null
+                        && InitialParametersClass.SystemSettings.IsolationNetworkModeActive;
+                }
+                catch (Exception)
+                {
+                    // a platform without the setting is not isolated
+                    return false;
+                }
+            }
+        }
+
+        /// <summary>
         /// Initializes a new instance of the MobileControlWebsocketServer class.
         /// </summary>
         public MobileControlWebsocketServer(string key, int customPort, MobileControlSystemController parent)
@@ -206,7 +228,20 @@ namespace PepperDash.Essentials.WebSocketServer
                 Port = customPort;
             }
 
-            if (parent.Config.DirectServer.AutomaticallyForwardPortToCSLAN == true)
+            if (parent.Config.DirectServer.AutomaticallyForwardPortToCSLAN == true && IsolationModeIsActive)
+            {
+                // Isolation mode blocks user port forwarding outright, so the call below can only
+                // fail. It used to fail loudly, as "Error adding port forwarding:
+                // IsolateNetworkModeActiveErr", which reads like the server itself did not come up -
+                // it did. The forward is only a convenience for reaching the Control Subnet from the
+                // LAN: clients on the LAN reach this server on the processor's LAN address, which
+                // isolation mode still admits as a programmatic listener, and clients on the Control
+                // Subnet are handed the Control Subnet address instead.
+                this.LogInformation(
+                    "Isolation mode is on, so the port forward to the CS LAN is not available and is being skipped. " +
+                    "Clients reach the direct server on whichever of the processor's addresses is on their own network.");
+            }
+            else if (parent.Config.DirectServer.AutomaticallyForwardPortToCSLAN == true)
             {
                 try
                 {

@@ -545,15 +545,10 @@ namespace PepperDash.Essentials.Touchpanel
                 return false;
             }) ? csIpAddress.ToString() : processorIp;
 
-            var match = Regex.Match(url, @"^http://([^:/]+):\d+/mc/app/?\?token=.+$");
-            if (match.Success)
-            {
-                string ipa = match.Groups[1].Value;
-                // ip will be "192.168.1.100"
-            }
-
-            // replace ipa with ip but leave the rest of the string intact
-            var updatedUrl = Regex.Replace(url, @"^http://[^:/]+", $"http://{ip}");
+            // Swap the host, keep the rest of the URL - including its scheme. Matching only http
+            // left a panel on the Control Subnet pointed at the processor's LAN address whenever the
+            // direct server was running secure, which under isolation mode it cannot reach at all.
+            var updatedUrl = Regex.Replace(url, @"^(https?://)[^:/]+", "${1}" + ip);
 
             this.LogVerbose("Updated URL: {updatedUrl}", updatedUrl);
 
