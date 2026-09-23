@@ -298,6 +298,73 @@ namespace PepperDash.Essentials.WebSocketServer
             AddPreActivationAction(() => AddWebApiPaths());
         }
 
+        /// <summary>
+        /// Reports, at startup, which addresses a client can actually reach this server on, and
+        /// whether isolation mode is active.
+        /// </summary>
+        /// <remarks>
+        /// The listener binds to every adapter, so the port alone never explained a client that
+        /// could not connect. Naming the addresses and the isolation state in the log means a boot
+        /// log answers "which address should a panel or browser use, and is the firewall in the
+        /// way" without anyone attaching to the console.
+        /// </remarks>
+        private void LogReachability()
+        {
+            var scheme = _parent.Config.DirectServer.Secure ? "https" : "http";
+            var lanAddress = GetAdapterAddress(EthernetAdapterType.EthernetLANAdapter);
+
+            this.LogInformation(
+                "Direct server reachable on the LAN at {url}",
+                string.IsNullOrEmpty(lanAddress)
+                    ? "(no LAN address reported)"
+                    : $"{scheme}://{lanAddress}:{Port}/mc/app");
+
+            var csAddress = csIpAddress?.ToString();
+
+            if (!string.IsNullOrEmpty(csAddress))
+            {
+                this.LogInformation(
+                    "Direct server reachable on the Control Subnet at {url}",
+                    $"{scheme}://{csAddress}:{Port}/mc/app");
+            }
+
+            if (IsolationModeIsActive)
+            {
+                // Isolation mode firewalls the LAN from the Control Subnet and disables user port
+                // forwarding. Crestron documents programmatic listen ports as still admitted from
+                // the LAN, so a client on the LAN should reach the address above; if it cannot, the
+                // firewall is the thing to prove, not this server.
+                this.LogInformation(
+                    "Isolation mode is ACTIVE. Clients on the LAN reach the LAN address above; clients on the " +
+                    "Control Subnet reach the Control Subnet address. Traffic between the two networks is blocked " +
+                    "by the processor, and user port forwarding is unavailable.");
+            }
+            else
+            {
+                this.LogInformation("Isolation mode is not active.");
+            }
+        }
+
+        /// <summary>
+        /// Returns the current address of an adapter, or an empty string when the processor has no
+        /// such adapter or does not report one.
+        /// </summary>
+        private string GetAdapterAddress(EthernetAdapterType adapterType)
+        {
+            try
+            {
+                var adapterId = CrestronEthernetHelper.GetAdapterdIdForSpecifiedAdapterType(adapterType);
+
+                return CrestronEthernetHelper.GetEthernetParameter(
+                    CrestronEthernetHelper.ETHERNET_PARAMETER_TO_GET.GET_CURRENT_IP_ADDRESS, adapterId);
+            }
+            catch (Exception ex)
+            {
+                this.LogDebug("Unable to read the address for adapter {adapter}: {message}", adapterType, ex.Message);
+                return string.Empty;
+            }
+        }
+
         private void AddWebApiPaths()
         {
             var apiServer = DeviceManager.AllDevices.OfType<EssentialsWebApi>().FirstOrDefault();
@@ -379,6 +446,8 @@ namespace PepperDash.Essentials.WebSocketServer
                 if (_server.IsListening)
                 {
                     this.LogInformation("Mobile Control WebSocket Server listening on port {port}", _server.Port);
+
+                    LogReachability();
                 }
 
                 CrestronEnvironment.ProgramStatusEventHandler += OnProgramStop;
