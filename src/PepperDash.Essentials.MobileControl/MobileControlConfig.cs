@@ -98,6 +98,15 @@ namespace PepperDash.Essentials
         public int RelayLoopbackPort { get; set; }
 
         /// <summary>
+        /// Gets or sets RelayLoopbackAddress - the address the server listens on behind the relay.
+        /// Loopback by default; set it to one of the processor's own addresses if the platform
+        /// refuses loopback. The port is unreachable from outside either way, because the firewall
+        /// never opened it.
+        /// </summary>
+        [JsonProperty("relayLoopbackAddress")]
+        public string RelayLoopbackAddress { get; set; }
+
+        /// <summary>
         /// Gets or sets MaxRelayConnections - simultaneous connections through the relay, 64 by
         /// default. A browser opens several at once per page, so this is not one per client.
         /// </summary>

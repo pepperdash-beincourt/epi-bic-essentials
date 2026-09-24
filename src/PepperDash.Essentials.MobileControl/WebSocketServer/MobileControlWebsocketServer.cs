@@ -202,6 +202,14 @@ namespace PepperDash.Essentials.WebSocketServer
         /// The port the server itself listens on. The same as the public port normally; behind the
         /// relay, a loopback port that only the relay connects to.
         /// </summary>
+        /// <summary>
+        /// The address the server itself binds behind the relay - see the config property.
+        /// </summary>
+        private System.Net.IPAddress ListenAddress =>
+            System.Net.IPAddress.TryParse(_parent.Config.DirectServer.RelayLoopbackAddress, out var configured)
+                ? configured
+                : System.Net.IPAddress.Loopback;
+
         private int ListenPort => !_parent.Config.DirectServer.UseCrestronSocket
             ? Port
             : _parent.Config.DirectServer.RelayLoopbackPort > 0
@@ -452,7 +460,7 @@ namespace PepperDash.Essentials.WebSocketServer
                 // Behind the relay the server binds loopback only, and the relay owns the public
                 // port: a Crestron socket is the only kind a processor in isolation mode admits.
                 _server = _parent.Config.DirectServer.UseCrestronSocket
-                    ? new HttpServer(System.Net.IPAddress.Loopback, ListenPort, false)
+                    ? new HttpServer(ListenAddress, ListenPort, false)
                     : new HttpServer(Port, false);
                 if (sslConfig != null)
                 {
@@ -486,7 +494,7 @@ namespace PepperDash.Essentials.WebSocketServer
 
                 if (_parent.Config.DirectServer.UseCrestronSocket)
                 {
-                    _relay = new CrestronSocketRelay(Key + "-relay", Port, ListenPort,
+                    _relay = new CrestronSocketRelay(Key + "-relay", Port, ListenAddress, ListenPort,
                         _parent.Config.DirectServer.MaxRelayConnections);
 
                     _relay.Start();

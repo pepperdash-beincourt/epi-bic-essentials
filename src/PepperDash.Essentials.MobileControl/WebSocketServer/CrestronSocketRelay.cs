@@ -53,6 +53,13 @@ namespace PepperDash.Essentials.WebSocketServer
         private readonly int _loopbackPort;
         private readonly int _maxConnections;
 
+        /// <summary>
+        /// The address the direct server listens on behind the relay. Loopback unless the platform
+        /// turns out to refuse it, in which case one of the processor's own addresses works as well -
+        /// the port is not reachable from outside either way, because the firewall never opened it.
+        /// </summary>
+        private readonly IPAddress _loopbackAddress;
+
         /// <summary>Loopback source port to the address of the client it carries. See the class remarks.</summary>
         private static readonly Dictionary<int, IPAddress> ClientAddressByLoopbackPort = new Dictionary<int, IPAddress>();
 
@@ -72,12 +79,14 @@ namespace PepperDash.Essentials.WebSocketServer
         /// </summary>
         /// <param name="key">device key</param>
         /// <param name="publicPort">the port clients connect to</param>
-        /// <param name="loopbackPort">the port the direct server listens on, over loopback</param>
+        /// <param name="loopbackAddress">the address the direct server listens on, null for loopback</param>
+        /// <param name="loopbackPort">the port the direct server listens on behind the relay</param>
         /// <param name="maxConnections">simultaneous connections to allow, 0 for the default</param>
-        public CrestronSocketRelay(string key, int publicPort, int loopbackPort, int maxConnections)
+        public CrestronSocketRelay(string key, int publicPort, IPAddress loopbackAddress, int loopbackPort, int maxConnections)
         {
             Key = key;
             _publicPort = publicPort;
+            _loopbackAddress = loopbackAddress ?? IPAddress.Loopback;
             _loopbackPort = loopbackPort;
             _maxConnections = maxConnections > 0 ? maxConnections : DefaultMaxConnections;
         }
@@ -119,11 +128,51 @@ namespace PepperDash.Essentials.WebSocketServer
                 this.LogInformation(
                     "Relaying port {publicPort} to the direct server on loopback port {loopbackPort}, up to {maxConnections} connections: {result}",
                     _publicPort, _loopbackPort, _maxConnections, result);
+
+                if (result != SocketErrorCodes.SOCKET_OK)
+                {
+                    this.LogError("Port {publicPort} did not open: {result}. Clients cannot reach the direct server.",
+                        _publicPort, result);
+                    return;
+                }
+
+                CheckLoopbackLeg();
             }
             catch (Exception ex)
             {
                 _server = null;
                 this.LogError(ex, "Could not open port {publicPort} for the direct server", _publicPort);
+            }
+        }
+
+        /// <summary>
+        /// Dials the direct server the same way a relayed connection will, and says whether it
+        /// answered.
+        /// </summary>
+        /// <remarks>
+        /// The two halves fail identically from a client's point of view - the connection does not
+        /// work - so the startup log has to separate them. This one line says whether the half that
+        /// cannot be tested from outside the processor is sound.
+        /// </remarks>
+        private void CheckLoopbackLeg()
+        {
+            try
+            {
+                using (var probe = new TcpClient())
+                {
+                    probe.Connect(_loopbackAddress, _loopbackPort);
+
+                    this.LogInformation("Direct server answered on {address}:{port}; the relay's inner leg is good",
+                        _loopbackAddress, _loopbackPort);
+                }
+            }
+            catch (Exception ex)
+            {
+                this.LogError(ex,
+                    "Direct server did not answer on {address}:{port}. The public port is open but nothing can be " +
+                    "carried to the server through it. If this platform refuses loopback, set " +
+                    "directServer.relayLoopbackAddress to one of the processor's own addresses.",
+                    _loopbackAddress, _loopbackPort);
             }
         }
 
@@ -179,7 +228,7 @@ namespace PepperDash.Essentials.WebSocketServer
                     _connections[clientIndex] = connection;
                 }
 
-                connection.Open(_loopbackPort);
+                connection.Open(_loopbackAddress, _loopbackPort);
 
                 var connected = server.NumberOfClientsConnected;
 
@@ -243,10 +292,10 @@ namespace PepperDash.Essentials.WebSocketServer
                 _clientAddress = clientAddress;
             }
 
-            public void Open(int loopbackPort)
+            public void Open(IPAddress loopbackAddress, int loopbackPort)
             {
                 _loopback = new TcpClient();
-                _loopback.Connect(IPAddress.Loopback, loopbackPort);
+                _loopback.Connect(loopbackAddress, loopbackPort);
                 _loopback.NoDelay = true;
                 _stream = _loopback.GetStream();
 
