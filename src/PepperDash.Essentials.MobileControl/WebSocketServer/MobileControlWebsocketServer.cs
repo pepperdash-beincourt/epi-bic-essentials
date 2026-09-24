@@ -431,6 +431,17 @@ namespace PepperDash.Essentials.WebSocketServer
             CrestronConsole.AddNewConsoleCommand(RemoveToken, "MobileRemoveUiClient", "Removes a client. ? for more help", ConsoleAccessLevelEnum.AccessOperator);
             CrestronConsole.AddNewConsoleCommand((s) => PrintClientInfo(), "MobileGetClientInfo", "Displays the current client info", ConsoleAccessLevelEnum.AccessOperator);
             CrestronConsole.AddNewConsoleCommand(RemoveAllTokens, "MobileRemoveAllClients", "Removes all clients", ConsoleAccessLevelEnum.AccessOperator);
+            CrestronConsole.AddNewConsoleCommand((s) => PrintRelayInfo(), "MobileRelayInfo", "State of the relay carrying the server's port", ConsoleAccessLevelEnum.AccessOperator);
+        }
+
+        /// <summary>
+        /// Prints what the relay is doing, or that the server holds its own port.
+        /// </summary>
+        private void PrintRelayInfo()
+        {
+            CrestronConsole.ConsoleCommandResponse((_relay == null
+                ? string.Format("The direct server holds port {0} itself; no relay is configured", Port)
+                : _relay.Describe()) + CrestronEnvironment.NewLine);
         }
 
 

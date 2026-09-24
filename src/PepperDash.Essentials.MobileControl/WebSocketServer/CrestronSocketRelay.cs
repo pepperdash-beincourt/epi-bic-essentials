@@ -71,6 +71,12 @@ namespace PepperDash.Essentials.WebSocketServer
 
         private TCPServer _server;
 
+        /// <summary>Connections accepted since the relay opened - see the log in OnClientConnected.</summary>
+        private int _accepted;
+
+        /// <summary>How many accepted connections are logged at information level before it quietens.</summary>
+        private const int AcceptsToLogPlainly = 5;
+
         /// <inheritdoc />
         public string Key { get; private set; }
 
@@ -129,7 +135,9 @@ namespace PepperDash.Essentials.WebSocketServer
                     "Relaying port {publicPort} to the direct server on loopback port {loopbackPort}, up to {maxConnections} connections: {result}",
                     _publicPort, _loopbackPort, _maxConnections, result);
 
-                if (result != SocketErrorCodes.SOCKET_OK)
+                // An async accept reports itself as pending, which is this call working as intended;
+                // only anything else is a failure to open the port.
+                if (result != SocketErrorCodes.SOCKET_OK && result != SocketErrorCodes.SOCKET_OPERATION_PENDING)
                 {
                     this.LogError("Port {publicPort} did not open: {result}. Clients cannot reach the direct server.",
                         _publicPort, result);
@@ -211,6 +219,22 @@ namespace PepperDash.Essentials.WebSocketServer
             }
         }
 
+        /// <summary>
+        /// One line describing what the relay is doing, for the console command and the log.
+        /// </summary>
+        public string Describe()
+        {
+            if (_server == null)
+            {
+                return string.Format("Relay on port {0} is not running", _publicPort);
+            }
+
+            return string.Format(
+                "Relay: port {0} -> {1}:{2}, status {3}, {4} of {5} connections in use, {6} accepted since start",
+                _publicPort, _loopbackAddress, _loopbackPort, _server.ServerSocketStatus,
+                _server.NumberOfClientsConnected, _maxConnections, _accepted);
+        }
+
         private void OnClientConnected(TCPServer server, uint clientIndex)
         {
             if (clientIndex == 0) return;
@@ -232,8 +256,18 @@ namespace PepperDash.Essentials.WebSocketServer
 
                 var connected = server.NumberOfClientsConnected;
 
-                this.LogVerbose("Relaying a connection from {clientAddress}, {connected} of {maxConnections} in use",
-                    clientAddressText, connected, _maxConnections);
+                // The first few are logged plainly: they are the proof that the relay carries traffic
+                // at all, and nobody turning a system up should have to raise the log level for it.
+                if (_accepted++ < AcceptsToLogPlainly)
+                {
+                    this.LogInformation("Relaying a connection from {clientAddress}, {connected} of {maxConnections} in use",
+                        clientAddressText, connected, _maxConnections);
+                }
+                else
+                {
+                    this.LogVerbose("Relaying a connection from {clientAddress}, {connected} of {maxConnections} in use",
+                        clientAddressText, connected, _maxConnections);
+                }
 
                 if (connected >= _maxConnections * BusyFraction)
                 {
