@@ -54,8 +54,8 @@ namespace PepperDash.Essentials.WebSocketServer
         private readonly int _maxConnections;
 
         /// <summary>
-        /// The adapter this relay listens on. It binds that adapter's own address rather than every
-        /// address, which is what leaves the same port free on loopback for the server itself.
+        /// The adapter this relay listens on. Measured on a CP4N, the Crestron socket takes the whole
+        /// port whichever adapter it is given, so this does not free the number for anything else.
         /// </summary>
         private readonly EthernetAdapterType _adapter;
 
@@ -347,12 +347,23 @@ namespace PepperDash.Essentials.WebSocketServer
             /// </summary>
             private bool Narrates => _relay._accepted <= 1;
 
+            /// <summary>
+            /// Points each request's Host header at the server's port - see HttpHostRewriter. Null when
+            /// the two ports are the same and there is nothing to rewrite.
+            /// </summary>
+            private readonly HttpHostRewriter _rewriter;
+
             public Connection(CrestronSocketRelay relay, TCPServer server, uint clientIndex, IPAddress clientAddress)
             {
                 _relay = relay;
                 _server = server;
                 _clientIndex = clientIndex;
                 _clientAddress = clientAddress;
+
+                if (relay._publicPort != relay._loopbackPort)
+                {
+                    _rewriter = new HttpHostRewriter(relay._publicPort, relay._loopbackPort);
+                }
             }
 
             public void Open(IPAddress loopbackAddress, int loopbackPort)
@@ -396,7 +407,20 @@ namespace PepperDash.Essentials.WebSocketServer
                     {
                         var buffer = server.GetIncomingDataBufferForSpecificClient(clientIndex);
 
-                        _stream.Write(buffer, 0, bytesReceived);
+                        if (_rewriter == null)
+                        {
+                            _stream.Write(buffer, 0, bytesReceived);
+                        }
+                        else
+                        {
+                            // may hold bytes back while a header block is still arriving
+                            var forward = _rewriter.Process(buffer, 0, bytesReceived);
+
+                            if (forward.Length > 0)
+                            {
+                                _stream.Write(forward, 0, forward.Length);
+                            }
+                        }
 
                         _fromClientBytes += bytesReceived;
 
@@ -491,8 +515,10 @@ namespace PepperDash.Essentials.WebSocketServer
                 _closed = true;
 
                 _relay.LogInformation(
-                    "Connection ended after {fromClientBytes} bytes in and {toClientBytes} bytes out: {reason}",
-                    _fromClientBytes, _toClientBytes, _endedBecause);
+                    "Connection ended after {fromClientBytes} bytes in and {toClientBytes} bytes out, {requests} request(s) routed{handover}: {reason}",
+                    _fromClientBytes, _toClientBytes, _rewriter?.RewrittenRequests ?? 0,
+                    _rewriter?.PassThroughReason == null ? "" : " then passed through for " + _rewriter.PassThroughReason,
+                    _endedBecause);
 
                 if (_loopbackPort != 0)
                 {
