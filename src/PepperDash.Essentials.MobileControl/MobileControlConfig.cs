@@ -92,7 +92,8 @@ namespace PepperDash.Essentials
 
         /// <summary>
         /// Gets or sets RelayLoopbackPort - the port the server itself listens on behind the relay.
-        /// Defaults to the public port plus 5000. Only used when UseCrestronSocket is set.
+        /// Leave it unset: the server has to keep the public port number, because a request is matched
+        /// to a listener by the port in its Host header, and only its address moves.
         /// </summary>
         [JsonProperty("relayLoopbackPort")]
         public int RelayLoopbackPort { get; set; }

@@ -190,13 +190,7 @@ namespace PepperDash.Essentials.WebSocketServer
             }
         }
 
-        /// <summary>
-        /// How far above the public port the server's own loopback port sits, when the relay owns the
-        /// public one and no port was configured.
-        /// </summary>
-        private const int RelayLoopbackPortOffset = 5000;
-
-        private CrestronSocketRelay _relay;
+        private readonly List<CrestronSocketRelay> _relays = new List<CrestronSocketRelay>();
 
         /// <summary>
         /// The port the server itself listens on. The same as the public port normally; behind the
@@ -210,11 +204,16 @@ namespace PepperDash.Essentials.WebSocketServer
                 ? configured
                 : System.Net.IPAddress.Loopback;
 
-        private int ListenPort => !_parent.Config.DirectServer.UseCrestronSocket
-            ? Port
-            : _parent.Config.DirectServer.RelayLoopbackPort > 0
-                ? _parent.Config.DirectServer.RelayLoopbackPort
-                : Port + RelayLoopbackPortOffset;
+        /// <summary>
+        /// The port the server itself listens on. It keeps the public port number even behind the
+        /// relay: websocket-sharp matches a request to a listener by the port in its Host header, and
+        /// a client's header names the port it dialled. Moving the server to another port made every
+        /// request match nothing and be answered with an error. Only the address changes, which is
+        /// enough for both to bind the same number.
+        /// </summary>
+        private int ListenPort => _parent.Config.DirectServer.RelayLoopbackPort > 0
+            ? _parent.Config.DirectServer.RelayLoopbackPort
+            : Port;
 
         /// <summary>
         /// Whether the processor is running in isolation mode - the console's `isolatenetworks on`.
@@ -435,13 +434,40 @@ namespace PepperDash.Essentials.WebSocketServer
         }
 
         /// <summary>
-        /// Prints what the relay is doing, or that the server holds its own port.
+        /// Opens a relay on each adapter that can carry clients: the LAN always, and the Control
+        /// Subnet when the processor has one. Each binds its own adapter's address, which is what
+        /// leaves the same port free on loopback for the server itself.
+        /// </summary>
+        private void StartRelays()
+        {
+            var adapters = new List<EthernetAdapterType> { EthernetAdapterType.EthernetLANAdapter };
+
+            if (csIpAddress != null)
+            {
+                adapters.Add(EthernetAdapterType.EthernetCSAdapter);
+            }
+
+            foreach (var adapter in adapters)
+            {
+                var relay = new CrestronSocketRelay($"{Key}-relay-{adapter}", Port, adapter, ListenAddress,
+                    ListenPort, _parent.Config.DirectServer.MaxRelayConnections);
+
+                _relays.Add(relay);
+
+                relay.Start();
+            }
+        }
+
+        /// <summary>
+        /// Prints what the relays are doing, or that the server holds its own port.
         /// </summary>
         private void PrintRelayInfo()
         {
-            CrestronConsole.ConsoleCommandResponse((_relay == null
+            var response = _relays.Count == 0
                 ? string.Format("The direct server holds port {0} itself; no relay is configured", Port)
-                : _relay.Describe()) + CrestronEnvironment.NewLine);
+                : string.Join(CrestronEnvironment.NewLine, _relays.Select(relay => relay.Describe()).ToArray());
+
+            CrestronConsole.ConsoleCommandResponse(response + CrestronEnvironment.NewLine);
         }
 
 
@@ -505,10 +531,7 @@ namespace PepperDash.Essentials.WebSocketServer
 
                 if (_parent.Config.DirectServer.UseCrestronSocket)
                 {
-                    _relay = new CrestronSocketRelay(Key + "-relay", Port, ListenAddress, ListenPort,
-                        _parent.Config.DirectServer.MaxRelayConnections);
-
-                    _relay.Start();
+                    StartRelays();
                 }
 
                 CrestronEnvironment.ProgramStatusEventHandler += OnProgramStop;
@@ -643,7 +666,7 @@ namespace PepperDash.Essentials.WebSocketServer
             switch (programEventType)
             {
                 case eProgramStatusEventType.Stopping:
-                    _relay?.Stop();
+                    _relays.ForEach(relay => relay.Stop());
                     _server.Stop();
                     break;
             }

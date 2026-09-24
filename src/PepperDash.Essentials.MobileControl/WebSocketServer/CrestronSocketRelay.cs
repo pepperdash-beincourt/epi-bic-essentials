@@ -54,6 +54,12 @@ namespace PepperDash.Essentials.WebSocketServer
         private readonly int _maxConnections;
 
         /// <summary>
+        /// The adapter this relay listens on. It binds that adapter's own address rather than every
+        /// address, which is what leaves the same port free on loopback for the server itself.
+        /// </summary>
+        private readonly EthernetAdapterType _adapter;
+
+        /// <summary>
         /// The address the direct server listens on behind the relay. Loopback unless the platform
         /// turns out to refuse it, in which case one of the processor's own addresses works as well -
         /// the port is not reachable from outside either way, because the firewall never opened it.
@@ -88,13 +94,15 @@ namespace PepperDash.Essentials.WebSocketServer
         /// </summary>
         /// <param name="key">device key</param>
         /// <param name="publicPort">the port clients connect to</param>
+        /// <param name="adapter">the adapter to listen on</param>
         /// <param name="loopbackAddress">the address the direct server listens on, null for loopback</param>
         /// <param name="loopbackPort">the port the direct server listens on behind the relay</param>
         /// <param name="maxConnections">simultaneous connections to allow, 0 for the default</param>
-        public CrestronSocketRelay(string key, int publicPort, IPAddress loopbackAddress, int loopbackPort, int maxConnections)
+        public CrestronSocketRelay(string key, int publicPort, EthernetAdapterType adapter, IPAddress loopbackAddress, int loopbackPort, int maxConnections)
         {
             Key = key;
             _publicPort = publicPort;
+            _adapter = adapter;
             _loopbackAddress = loopbackAddress ?? IPAddress.Loopback;
             _loopbackPort = loopbackPort;
             _maxConnections = maxConnections > 0 ? maxConnections : DefaultMaxConnections;
@@ -129,8 +137,7 @@ namespace PepperDash.Essentials.WebSocketServer
 
             try
             {
-                _server = new TCPServer("0.0.0.0", _publicPort, BufferSize,
-                    EthernetAdapterType.EthernetUnknownAdapter, _maxConnections)
+                _server = new TCPServer("0.0.0.0", _publicPort, BufferSize, _adapter, _maxConnections)
                 {
                     // Every read has to start at the beginning of the buffer. Left off, received
                     // data accumulates and a read hands back bytes that were already relayed, which
@@ -141,8 +148,8 @@ namespace PepperDash.Essentials.WebSocketServer
                 var result = _server.WaitForConnectionsAlways(OnClientConnected);
 
                 this.LogInformation(
-                    "Relaying port {publicPort} to the direct server on loopback port {loopbackPort}, up to {maxConnections} connections: {result}",
-                    _publicPort, _loopbackPort, _maxConnections, result);
+                    "Relaying {adapter} port {publicPort} to the direct server on {loopbackAddress}:{loopbackPort}, up to {maxConnections} connections: {result}",
+                    _adapter, _publicPort, _loopbackAddress, _loopbackPort, _maxConnections, result);
 
                 // An async accept reports itself as pending, which is this call working as intended;
                 // only anything else is a failure to open the port.
@@ -239,8 +246,8 @@ namespace PepperDash.Essentials.WebSocketServer
             }
 
             return string.Format(
-                "Relay: port {0} -> {1}:{2}, status {3}, {4} of {5} connections in use, {6} accepted since start",
-                _publicPort, _loopbackAddress, _loopbackPort, _server.ServerSocketStatus,
+                "Relay on {0}: port {1} -> {2}:{3}, status {4}, {5} of {6} connections in use, {7} accepted since start",
+                _adapter, _publicPort, _loopbackAddress, _loopbackPort, _server.ServerSocketStatus,
                 _server.NumberOfClientsConnected, _maxConnections, _accepted);
         }
 
