@@ -77,6 +77,9 @@ namespace PepperDash.Essentials.WebSocketServer
         /// <summary>How many accepted connections are logged at information level before it quietens.</summary>
         private const int AcceptsToLogPlainly = 5;
 
+        /// <summary>How much of a stream's first bytes the log shows - enough for an HTTP start line.</summary>
+        private const int PreviewLength = 120;
+
         /// <inheritdoc />
         public string Key { get; private set; }
 
@@ -127,7 +130,13 @@ namespace PepperDash.Essentials.WebSocketServer
             try
             {
                 _server = new TCPServer("0.0.0.0", _publicPort, BufferSize,
-                    EthernetAdapterType.EthernetUnknownAdapter, _maxConnections);
+                    EthernetAdapterType.EthernetUnknownAdapter, _maxConnections)
+                {
+                    // Every read has to start at the beginning of the buffer. Left off, received
+                    // data accumulates and a read hands back bytes that were already relayed, which
+                    // corrupts anything with a length or a frame - which is to say all of it.
+                    ClearIncomingDataBuffer = true,
+                };
 
                 var result = _server.WaitForConnectionsAlways(OnClientConnected);
 
@@ -318,6 +327,19 @@ namespace PepperDash.Essentials.WebSocketServer
             private int _loopbackPort;
             private bool _closed;
 
+            private long _fromClientBytes;
+            private long _toClientBytes;
+
+            /// <summary>Why this connection ended, for the log line when it does.</summary>
+            private string _endedBecause = "not ended";
+
+            /// <summary>
+            /// Whether this connection reports what it carries. The first connection after the relay
+            /// opens does, which is enough to see a request go out and a response come back without
+            /// filling the log with every asset the app fetches.
+            /// </summary>
+            private bool Narrates => _relay._accepted <= 1;
+
             public Connection(CrestronSocketRelay relay, TCPServer server, uint clientIndex, IPAddress clientAddress)
             {
                 _relay = relay;
@@ -358,6 +380,7 @@ namespace PepperDash.Essentials.WebSocketServer
                 {
                     if (bytesReceived <= 0)
                     {
+                        _endedBecause = "the client closed";
                         _relay.EndConnection(_clientIndex);
                         return;
                     }
@@ -368,11 +391,19 @@ namespace PepperDash.Essentials.WebSocketServer
 
                         _stream.Write(buffer, 0, bytesReceived);
 
+                        _fromClientBytes += bytesReceived;
+
+                        if (Narrates && _fromClientBytes == bytesReceived)
+                        {
+                            _relay.LogInformation("First {bytes} bytes from the client: {preview}",
+                                bytesReceived, Preview(buffer, bytesReceived));
+                        }
+
                         ReadFromClient();
                     }
-                    catch (Exception)
+                    catch (Exception ex)
                     {
-                        // the direct server end has gone; take the client down with it
+                        _endedBecause = "writing to the server failed: " + ex.Message;
                         _relay.EndConnection(_clientIndex);
                     }
                 });
@@ -401,19 +432,49 @@ namespace PepperDash.Essentials.WebSocketServer
 
                     if (bytesRead <= 0)
                     {
+                        _endedBecause = "the server closed";
                         _relay.EndConnection(_clientIndex);
                         return;
                     }
 
-                    _server.SendData(_clientIndex, _fromServerBuffer, bytesRead);
+                    var sent = _server.SendData(_clientIndex, _fromServerBuffer, bytesRead);
+
+                    _toClientBytes += bytesRead;
+
+                    if (Narrates && _toClientBytes == bytesRead)
+                    {
+                        _relay.LogInformation("First {bytes} bytes from the server: {preview}",
+                            bytesRead, Preview(_fromServerBuffer, bytesRead));
+                    }
+
+                    if (sent != SocketErrorCodes.SOCKET_OK && sent != SocketErrorCodes.SOCKET_OPERATION_PENDING)
+                    {
+                        _relay.LogWarning("Sending {bytes} bytes to the client returned {sent}", bytesRead, sent);
+                    }
 
                     ReadFromServer();
                 }
-                catch (Exception)
+                catch (Exception ex)
                 {
                     // either end closing lands here; closing both is the only correct response
+                    _endedBecause = "reading from the server failed: " + ex.Message;
                     _relay.EndConnection(_clientIndex);
                 }
+            }
+
+            /// <summary>The first bytes of a stream as text, for telling a request from a response.</summary>
+            private static string Preview(byte[] buffer, int length)
+            {
+                var text = System.Text.Encoding.ASCII.GetString(buffer, 0, Math.Min(length, PreviewLength));
+                var readable = new System.Text.StringBuilder(text.Length);
+
+                foreach (var character in text)
+                {
+                    // line breaks and anything else unprintable become dots, so a start line stays on one log line
+                    readable.Append(character < ' ' || character > '~' ? '.' : character);
+                }
+
+                return readable.ToString();
             }
 
             public void Close()
@@ -421,6 +482,10 @@ namespace PepperDash.Essentials.WebSocketServer
                 if (_closed) return;
 
                 _closed = true;
+
+                _relay.LogInformation(
+                    "Connection ended after {fromClientBytes} bytes in and {toClientBytes} bytes out: {reason}",
+                    _fromClientBytes, _toClientBytes, _endedBecause);
 
                 if (_loopbackPort != 0)
                 {
