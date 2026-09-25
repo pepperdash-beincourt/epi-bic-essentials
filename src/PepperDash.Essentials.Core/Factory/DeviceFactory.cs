@@ -109,6 +109,27 @@ public class DeviceFactory
         new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
+    /// Assemblies whose factories have built at least one device or room from the running
+    /// configuration. Every loaded plugin registers its types, but only some are configured on a
+    /// given system; this is what lets a plugin be reported as in use (see LoadedAssembly.InUse).
+    /// </summary>
+    private static readonly HashSet<Assembly> AssembliesInUse = [];
+
+    /// <summary>
+    /// Returns true if a device or room from the running configuration was built by a factory
+    /// declared in <paramref name="assembly"/>.
+    /// </summary>
+    public static bool IsAssemblyInUse(Assembly assembly)
+    {
+        if (assembly == null) return false;
+
+        lock (AssembliesInUse)
+        {
+            return AssembliesInUse.Contains(assembly);
+        }
+    }
+
+    /// <summary>
     /// Registers a factory method for creating instances of a specific type.
     /// </summary>
     /// <remarks>This method associates a type name with a factory method, allowing instances of the type to
@@ -212,11 +233,21 @@ public class DeviceFactory
             Debug.LogInformation("Loading '{type}' from {assemblyName}", typeName, wrapper.Type.Assembly.FullName);
 
             // Check for types that have been added by plugin dlls.
-            return wrapper.FactoryMethod(localDc);
+            var device = wrapper.FactoryMethod(localDc);
+
+            if (device != null && wrapper.Type != null)
+            {
+                lock (AssembliesInUse)
+                {
+                    AssembliesInUse.Add(wrapper.Type.Assembly);
+                }
+            }
+
+            return device;
         }
         catch (Exception ex)
         {
-            Debug.LogError(ex, "Exception occurred while creating device {0}: {1}", null, dc.Key, ex.Message);
+            Debug.LogError(ex, "Exception occurred while creating device {deviceKey}: {message}", dc.Key, ex.Message);
             return null;
         }
     }
@@ -266,5 +297,18 @@ public class DeviceFactory
         return string.IsNullOrEmpty(filter)
             ? FactoryMethods
             : FactoryMethods.Where(k => k.Key.Contains(filter)).ToDictionary(k => k.Key, k => k.Value);
+    }
+
+    /// <summary>
+    /// Indicates whether a factory is registered for the specified device type name.
+    /// </summary>
+    /// <remarks>Lets callers of <see cref="GetDevice"/> distinguish a genuinely unknown device type from a
+    /// known type whose factory failed to build the device (both currently return <see langword="null"/> from
+    /// <see cref="GetDevice"/>), so the two can be logged with accurate, distinct messages.</remarks>
+    /// <param name="typeName">The device type name to check. Matching is case-insensitive.</param>
+    /// <returns><see langword="true"/> if a factory is registered for <paramref name="typeName"/>; otherwise <see langword="false"/>.</returns>
+    public static bool HasFactoryForType(string typeName)
+    {
+        return !string.IsNullOrEmpty(typeName) && FactoryMethods.ContainsKey(typeName);
     }
 }

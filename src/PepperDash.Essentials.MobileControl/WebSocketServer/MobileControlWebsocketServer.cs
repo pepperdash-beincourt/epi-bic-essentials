@@ -7,8 +7,10 @@ using System.IO.Compression;
 using System.Linq;
 using System.Net.Http;
 using System.Security.Authentication;
+using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using System.Text.RegularExpressions;
 using Crestron.SimplSharp;
 using Crestron.SimplSharp.WebScripting;
 using Newtonsoft.Json;
@@ -77,6 +79,16 @@ namespace PepperDash.Essentials.WebSocketServer
         private readonly ConcurrentDictionary<string, ConcurrentBag<(string clientId, DateTime timestamp)>> legacyClientRegistrations = new ConcurrentDictionary<string, ConcurrentBag<(string, DateTime)>>();
 
         /// <summary>
+        /// Vite emits content-hashed bundles as assets/&lt;name&gt;-&lt;hash&gt;.&lt;ext&gt;; any change to
+        /// their content produces a new filename, so those are safe to cache indefinitely. Everything
+        /// else the user app requests by a fixed path (index.html, the app config JSON, icons and
+        /// logos) must never be stored by a client - see HandleUserAppRequest.
+        /// </summary>
+        private static readonly Regex HashedAssetPattern = new Regex(
+            @"[\\/]assets[\\/][^\\/]+-[A-Za-z0-9_-]{6,}\.(js|css|woff2?|ttf|png|jpe?g|svg|webp)$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        /// <summary>
         /// Gets the collection of UI clients
         /// </summary>
         public IReadOnlyDictionary<string, UiClient> UiClients => uiClients;
@@ -135,13 +147,37 @@ namespace PepperDash.Essentials.WebSocketServer
         {
             get
             {
-                return string.Format("http://{0}:{1}{2}?token=",
+                // The server itself only listens for TLS when DirectServer.Secure is set (see
+                // Initialize()'s sslConfig setup above) - this must follow that same flag rather
+                // than hardcoding http, or a secure server hands out a URL its own touchpanel
+                // clients embed in an HTTPS-hosted iframe, where it gets silently dropped as
+                // mixed content instead of ever loading.
+                var scheme = _parent.Config.DirectServer.Secure ? "https" : "http";
+
+                return string.Format("{0}://{1}:{2}{3}?token=",
+                    scheme,
                     CrestronEthernetHelper.GetEthernetParameter(CrestronEthernetHelper.ETHERNET_PARAMETER_TO_GET.GET_CURRENT_IP_ADDRESS, 0),
                     Port,
                     _userAppBaseHref);
 
             }
         }
+
+        /// <summary>
+        /// Short fingerprint of the user app bundle currently deployed in mcUserApp, or an empty
+        /// string when no bundle is deployed. Recomputed on every startup after the deploy step.
+        /// </summary>
+        /// <remarks>
+        /// Appended to the app URL handed to touchpanels (see AddClientsForTouchpanels). The
+        /// touchpanel wrapper app reloads its iframe whenever the URL string on join 1 changes and
+        /// never otherwise, so a running panel only picked up a new react-app build when someone
+        /// pulsed ReloadIframe from the console. Stamping the URL with the bundle fingerprint makes
+        /// that reload happen exactly when a new bundle is deployed: online panels reload as soon as
+        /// the program starts with it, offline panels get the new URL when they next come online, and
+        /// a restart without a new bundle changes nothing. index.html is the fingerprint source
+        /// because Vite rewrites it with new content-hashed asset names on every build.
+        /// </remarks>
+        public string UserAppBundleStamp { get; private set; } = string.Empty;
 
         /// <summary>
         /// Gets the count of connected UI clients
@@ -151,6 +187,28 @@ namespace PepperDash.Essentials.WebSocketServer
             get
             {
                 return uiClients.Values.Where(c => c.Context.WebSocket.IsAlive).Count();
+            }
+        }
+
+        /// <summary>
+        /// Whether the processor is running in isolation mode - the console's `isolatenetworks on`.
+        /// Read from the firmware's own settings rather than inferred from a call that failed, so the
+        /// log can explain what is about to be skipped instead of reporting an error afterwards.
+        /// </summary>
+        private static bool IsolationModeIsActive
+        {
+            get
+            {
+                try
+                {
+                    return InitialParametersClass.SystemSettings != null
+                        && InitialParametersClass.SystemSettings.IsolationNetworkModeActive;
+                }
+                catch (Exception)
+                {
+                    // a platform without the setting is not isolated
+                    return false;
+                }
             }
         }
 
@@ -170,7 +228,20 @@ namespace PepperDash.Essentials.WebSocketServer
                 Port = customPort;
             }
 
-            if (parent.Config.DirectServer.AutomaticallyForwardPortToCSLAN == true)
+            if (parent.Config.DirectServer.AutomaticallyForwardPortToCSLAN == true && IsolationModeIsActive)
+            {
+                // Isolation mode blocks user port forwarding outright, so the call below can only
+                // fail. It used to fail loudly, as "Error adding port forwarding:
+                // IsolateNetworkModeActiveErr", which reads like the server itself did not come up -
+                // it did. The forward is only a convenience for reaching the Control Subnet from the
+                // LAN: clients on the LAN reach this server on the processor's LAN address, which
+                // isolation mode still admits as a programmatic listener, and clients on the Control
+                // Subnet are handed the Control Subnet address instead.
+                this.LogInformation(
+                    "Isolation mode is on, so the port forward to the CS LAN is not available and is being skipped. " +
+                    "Clients reach the direct server on whichever of the processor's addresses is on their own network.");
+            }
+            else if (parent.Config.DirectServer.AutomaticallyForwardPortToCSLAN == true)
             {
                 try
                 {
@@ -356,11 +427,10 @@ namespace PepperDash.Essentials.WebSocketServer
             foreach (var client in touchpanelsToAdd)
             {
                 var bridge = _parent.GetRoomBridge(client.DefaultRoomKey);
-
                 if (bridge == null)
                 {
                     this.LogWarning("Unable to find room with key: {defaultRoomKey}", client.DefaultRoomKey);
-                    return;
+                    continue;
                 }
 
                 var (key, path) = GenerateClientToken(bridge, client.Key);
@@ -404,11 +474,23 @@ namespace PepperDash.Essentials.WebSocketServer
                     ip = csIpAddress.ToString();
                 }
 
-                var appUrl = $"http://{ip}:{_parent.Config.DirectServer.Port}/mc/app/?token={touchpanel.Key}";
+                // Must follow DirectServer.Secure like the server's own Initialize() does (see
+                // UserAppUrlPrefix above for the same fix) - a secure server handing out an http
+                // URL gets embedded in the touchpanel wrapper app's HTTPS-hosted iframe, where
+                // it's silently dropped as mixed content instead of ever loading.
+                var scheme = _parent.Config.DirectServer.Secure ? "https" : "http";
+
+                // The bundle stamp goes after the token: every consumer of this URL parses the query
+                // properly (HandleJoinRequest via req.QueryString, the react app core via
+                // URLSearchParams, the wrapper app via URL), and the panel controller's IP rewrite only
+                // touches the host. See UserAppBundleStamp for why it is here at all.
+                var bundleQuery = string.IsNullOrEmpty(UserAppBundleStamp) ? string.Empty : $"&bundle={UserAppBundleStamp}";
+
+                var appUrl = $"{scheme}://{ip}:{_parent.Config.DirectServer.Port}/mc/app/?token={touchpanel.Key}{bundleQuery}";
 
                 this.LogVerbose("Sending URL {appUrl} to touchpanel {touchpanelKey}", appUrl, touchpanel.Touchpanel.Key);
 
-                touchpanel.Touchpanel.SetAppUrl($"http://{ip}:{_parent.Config.DirectServer.Port}/mc/app/?token={touchpanel.Key}");
+                touchpanel.Touchpanel.SetAppUrl(appUrl);
             }
         }
 
@@ -430,6 +512,8 @@ namespace PepperDash.Essentials.WebSocketServer
             }
 
             DeployMcUserAppZipIfPresent();
+
+            UpdateUserAppBundleStamp();
 
             if (!Directory.Exists($"{userAppPath}{localConfigFolderName}"))
             {
@@ -481,6 +565,42 @@ namespace PepperDash.Essentials.WebSocketServer
                 var contents = JsonConvert.SerializeObject(config, Formatting.Indented);
 
                 sw.Write(contents);
+            }
+        }
+
+        /// <summary>
+        /// Recomputes UserAppBundleStamp from the deployed user app's index.html. Must run after
+        /// DeployMcUserAppZipIfPresent and before AddClientsForTouchpanels builds any app URL.
+        /// </summary>
+        private void UpdateUserAppBundleStamp()
+        {
+            var indexPath = $"{userAppPath}index.html";
+
+            try
+            {
+                if (!File.Exists(indexPath))
+                {
+                    UserAppBundleStamp = string.Empty;
+                    this.LogWarning("No user app index.html at {indexPath}; touchpanel app URLs will carry no bundle stamp", indexPath);
+                    return;
+                }
+
+                using (var sha = SHA256.Create())
+                using (var stream = File.OpenRead(indexPath))
+                {
+                    var hash = sha.ComputeHash(stream);
+
+                    // 5 bytes = 10 hex characters: plenty to distinguish builds, short enough to read in a log.
+                    UserAppBundleStamp = BitConverter.ToString(hash, 0, 5).Replace("-", string.Empty).ToLowerInvariant();
+                }
+
+                this.LogInformation("User app bundle stamp {stamp}", UserAppBundleStamp);
+            }
+            catch (Exception ex)
+            {
+                UserAppBundleStamp = string.Empty;
+                this.LogError("Error computing user app bundle stamp from {indexPath}: {message}", indexPath, ex.Message);
+                this.LogDebug(ex, "Stack Trace");
             }
         }
 
@@ -593,9 +713,13 @@ namespace PepperDash.Essentials.WebSocketServer
         {
             try
             {
+                // Must follow DirectServer.Secure like the server's own Initialize() does - see
+                // UserAppUrlPrefix for the same fix.
+                var scheme = _parent.Config.DirectServer.Secure ? "https" : "http";
+
                 var config = new MobileControlApplicationConfig
                 {
-                    ApiPath = string.Format("http://{0}:{1}/mc/api", processorIp, _parent.Config.DirectServer.Port),
+                    ApiPath = string.Format("{0}://{1}:{2}/mc/api", scheme, processorIp, _parent.Config.DirectServer.Port),
                     GatewayAppPath = "",
                     LogoPath = _parent.Config.ApplicationConfig?.LogoPath ?? "logo/logo.png",
                     EnableDev = _parent.Config.ApplicationConfig?.EnableDev ?? false,
@@ -1260,6 +1384,21 @@ namespace PepperDash.Essentials.WebSocketServer
 
             this.LogVerbose("Join Room Request with token: {token}", token);
 
+            // This endpoint hands out a fresh, one-time-use clientId on every call (see
+            // Utilities.GetNextClientId() below) - the client is expected to re-hit it on every
+            // reconnect. The touchpanel wrapper app's embedded WebView has been observed serving a
+            // stored response for a fixed URL indefinitely, without contacting the server again:
+            // it replayed a clientId from an earlier server session on every reconnect, which
+            // RegisterUiClient correctly rejected as unregistered, forever (confirmed via live
+            // testing - the value survived program restarts and a panel power cycle, and only a
+            // never-seen URL, i.e. a rotated token, broke the loop). no-store here keeps the
+            // response from being stored in the first place; it cannot evict an entry a client
+            // stored before this header existed, so a client already stuck needs its token
+            // rotated (MobileRemoveUiClient <token>, then restart) to escape.
+            res.AddHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+            res.AddHeader("Pragma", "no-cache");
+            res.AddHeader("Expires", "0");
+
             byte[] body;
 
             if (string.IsNullOrEmpty(token) || !UiClientContexts.TryGetValue(token, out UiClientContext clientContext))
@@ -1322,8 +1461,13 @@ namespace PepperDash.Essentials.WebSocketServer
 
             this.LogVerbose("Assigning ClientId: {clientId} for token: {token} at {timestamp}", clientId, token, now);
 
-            // Construct WebSocket URL with clientId query parameter
-            var wsProtocol = "ws";
+            // Construct WebSocket URL with clientId query parameter. Both this and UserAppUrl
+            // below must follow DirectServer.Secure like the server's own Initialize() does (see
+            // UserAppUrlPrefix and AddClientsForTouchpanels for the same fix) - a secure server
+            // handing out ws:// or http:// URLs breaks clients loaded over https, which refuse
+            // the insecure connection/frame instead of ever completing it.
+            var httpScheme = _parent.Config.DirectServer.Secure ? "https" : "http";
+            var wsProtocol = _parent.Config.DirectServer.Secure ? "wss" : "ws";
             var wsUrl = $"{wsProtocol}://{CrestronEthernetHelper.GetEthernetParameter(CrestronEthernetHelper.ETHERNET_PARAMETER_TO_GET.GET_CURRENT_IP_ADDRESS, 0)}:{Port}{_wsPath}{token}?clientId={clientId}";
 
             // Construct the response object
@@ -1336,7 +1480,8 @@ namespace PepperDash.Essentials.WebSocketServer
                 Config = _parent.GetConfigWithPluginVersion(),
                 CodeExpires = new DateTime().AddYears(1),
                 UserCode = bridge.UserCode,
-                UserAppUrl = string.Format("http://{0}:{1}/mc/app/",
+                UserAppUrl = string.Format("{0}://{1}:{2}/mc/app/",
+                httpScheme,
                 CrestronEthernetHelper.GetEthernetParameter(CrestronEthernetHelper.ETHERNET_PARAMETER_TO_GET.GET_CURRENT_IP_ADDRESS, 0),
                 Port),
                 WebSocketUrl = wsUrl,
@@ -1397,19 +1542,19 @@ namespace PepperDash.Essentials.WebSocketServer
             {
                 if (filePath.EndsWith(".png"))
                 {
-                    res.ContentType = "image/png";
+                    SetImageContentType(res, "image/png");
                 }
                 else if (filePath.EndsWith(".jpg"))
                 {
-                    res.ContentType = "image/jpeg";
+                    SetImageContentType(res, "image/jpeg");
                 }
                 else if (filePath.EndsWith(".gif"))
                 {
-                    res.ContentType = "image/gif";
+                    SetImageContentType(res, "image/gif");
                 }
                 else if (filePath.EndsWith(".svg"))
                 {
-                    res.ContentType = "image/svg+xml";
+                    SetImageContentType(res, "image/svg+xml");
                 }
                 byte[] contents = File.ReadAllBytes(filePath);
                 res.ContentLength64 = contents.LongLength;
@@ -1429,6 +1574,25 @@ namespace PepperDash.Essentials.WebSocketServer
                 res.StatusCode = (int)HttpStatusCode.NotFound;
                 res.Close();
             }
+        }
+
+        /// <summary>
+        /// Sets an image content type with no charset parameter.
+        /// </summary>
+        /// <remarks>
+        /// Server_OnGet defaults ContentEncoding to UTF-8, and websocket-sharp then emits
+        /// "Content-Type: image/svg+xml; charset=utf-8". Crestron's CH5 touchpanel host intercepts
+        /// every http image request itself and hands the WebView that raw header value as the
+        /// response's MIME type, unparsed. Chromium sniffs raster formats regardless of the declared
+        /// type, but only decodes a response as SVG when the MIME type is exactly "image/svg+xml" -
+        /// so with the parameter attached every served SVG failed to render on a TS-1070
+        /// (fw 3.003.0021, WebView 118) while PNGs survived; the same bytes typed bare rendered fine.
+        /// Verified 2026-09-07. A charset is meaningless on a binary type in any case.
+        /// </remarks>
+        private static void SetImageContentType(HttpListenerResponse res, string mimeType)
+        {
+            res.ContentType = mimeType;
+            res.ContentEncoding = null;
         }
 
         /// <summary>
@@ -1496,27 +1660,27 @@ namespace PepperDash.Essentials.WebSocketServer
             }
             else if (filePath.EndsWith(".svg"))
             {
-                res.ContentType = "image/svg+xml";
+                SetImageContentType(res, "image/svg+xml");
             }
             else if (filePath.EndsWith(".png"))
             {
-                res.ContentType = "image/png";
+                SetImageContentType(res, "image/png");
             }
             else if (filePath.EndsWith(".jpg") || filePath.EndsWith(".jpeg"))
             {
-                res.ContentType = "image/jpeg";
+                SetImageContentType(res, "image/jpeg");
             }
             else if (filePath.EndsWith(".gif"))
             {
-                res.ContentType = "image/gif";
+                SetImageContentType(res, "image/gif");
             }
             else if (filePath.EndsWith(".webp"))
             {
-                res.ContentType = "image/webp";
+                SetImageContentType(res, "image/webp");
             }
             else if (filePath.EndsWith(".ico"))
             {
-                res.ContentType = "image/x-icon";
+                SetImageContentType(res, "image/x-icon");
             }
 
             this.LogVerbose("Attempting to serve file: {filePath}", filePath);
@@ -1538,10 +1702,27 @@ namespace PepperDash.Essentials.WebSocketServer
             else
             {
                 this.LogWarning("File not found: {filePath}", filePath);
+
+                // A miss must never be storable. On every program restart there is a window where
+                // this server is already listening but mcUserApp has not been re-extracted yet, so a
+                // client loading during it gets an empty 404 for every asset it asks for. The
+                // touchpanel wrapper app's WebView has been observed serving a stored response for a
+                // fixed URL indefinitely (the /joinroom case, confirmed via live testing), so a
+                // stored 404 would mask the asset until its URL changed. Same applies to any
+                // transient miss.
+                res.AddHeader("Cache-Control", "no-store");
                 res.StatusCode = (int)HttpStatusCode.NotFound;
                 res.Close();
                 return;
             }
+
+            // Content-hashed bundles change name whenever their content changes, so they can be
+            // cached indefinitely. Everything requested by a fixed path (index.html, the app config
+            // JSON, icons/logos) must not be stored at all - for the same client behavior described
+            // above, a stored copy would otherwise mask every future build and config change.
+            res.AddHeader("Cache-Control", HashedAssetPattern.IsMatch(filePath)
+                ? "public, max-age=31536000, immutable"
+                : "no-store");
 
             res.ContentLength64 = contents.LongLength;
             try
@@ -1577,12 +1758,7 @@ namespace PepperDash.Essentials.WebSocketServer
         {
             foreach (var client in uiClients.Values)
             {
-                if (!client.Context.WebSocket.IsAlive)
-                {
-                    continue;
-                }
-
-                client.Context.WebSocket.Send(message);
+                TrySend(client.Id, client.Context.WebSocket, message);
             }
         }
 
@@ -1603,18 +1779,42 @@ namespace PepperDash.Essentials.WebSocketServer
 
             if (uiClients.TryGetValue((string)clientId, out var client))
             {
-                var socket = client.Context.WebSocket;
-
-                if (!socket.IsAlive)
-                {
-                    this.LogError("Unable to send message to client {id}. Client is disconnected: {message}", clientId, message);
-                    return;
-                }
-                socket.Send(message);
+                TrySend(client.Id, client.Context.WebSocket, message);
             }
             else
             {
                 this.LogWarning("Unable to find client with ID: {clientId}", clientId);
+            }
+        }
+
+        /// <summary>
+        /// Sends on an open socket, dropping the message only when the socket is genuinely not open.
+        /// </summary>
+        /// <remarks>
+        /// This used to gate on WebSocket.IsAlive, which in websocket-sharp is not a status flag: it
+        /// sends a ping and returns false unless the pong arrives within about a second. A browser busy
+        /// re-rendering (the In Session page right after Begin Session, for instance) can miss that
+        /// window on a perfectly good connection, so the server logged "Client is disconnected" and
+        /// silently dropped the very state message the client was waiting for - seen live at Reston:
+        /// the room entered In Session while the UI fell back to the Lobby. ReadyState reflects the
+        /// real connection state; a socket that has actually died raises OnClose, and a send that
+        /// fails anyway is logged rather than pre-empted by a ping.
+        /// </remarks>
+        private void TrySend(string clientId, WebSocket socket, string message)
+        {
+            if (socket == null || socket.ReadyState != WebSocketState.Open)
+            {
+                this.LogWarning("Unable to send message to client {id}: socket state is {state}", clientId, socket?.ReadyState);
+                return;
+            }
+
+            try
+            {
+                socket.Send(message);
+            }
+            catch (Exception ex)
+            {
+                this.LogWarning("Send to client {id} failed: {message}", clientId, ex.Message);
             }
         }
     }

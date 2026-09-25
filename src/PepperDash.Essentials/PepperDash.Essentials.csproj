@@ -33,6 +33,11 @@
     </AssemblyAttribute>
   </ItemGroup>
   <ItemGroup>
+    <!-- Branding files copied into the extracted dev tools app at startup - see DevToolsBranding -->
+    <EmbeddedResource Include="Branding\branding.js" />
+    <EmbeddedResource Include="Branding\branding.css" />
+  </ItemGroup>
+  <ItemGroup>
     <PackageReference Include="Crestron.SimplSharp.SDK.Program" Version="2.21.128" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
   </ItemGroup>

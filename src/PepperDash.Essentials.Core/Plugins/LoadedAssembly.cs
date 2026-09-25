@@ -29,6 +29,14 @@ public class LoadedAssembly(string name, string version, Assembly assembly)
     public string Version { get; private set; } = version;
 
     /// <summary>
+    /// True once a device or room in the running configuration has been built by a factory from
+    /// this assembly. Evaluated at serialization time, so it reflects the system as configured,
+    /// not merely which plugins are present in the plugins folder.
+    /// </summary>
+    [JsonProperty("inUse")]
+    public bool InUse => Core.DeviceFactory.IsAssemblyInUse(Assembly);
+
+    /// <summary>
     /// Gets the assembly associated with the current instance.
     /// </summary>
     [JsonIgnore]
