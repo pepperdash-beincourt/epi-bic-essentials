@@ -14,6 +14,7 @@ using System.Text.RegularExpressions;
 using Crestron.SimplSharp;
 using Crestron.SimplSharp.WebScripting;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using Org.BouncyCastle.Crypto.Prng;
 using PepperDash.Core;
 using PepperDash.Core.Logging;
@@ -42,9 +43,7 @@ namespace PepperDash.Essentials.WebSocketServer
         private readonly string appConfigFileName = "_config.local.json";
         private readonly string appConfigCsFileName = "_config.cs.json";
 
-        private const string certificateName = "selfCres";
-
-        private const string certificatePassword = "cres12345";
+        private const string certificatePassword = PepperDash.Core.Web.ProcessorCertificate.Password;
 
         /// <summary>
         /// Where the key is the join token and the value is the room key
@@ -64,6 +63,14 @@ namespace PepperDash.Essentials.WebSocketServer
         public Dictionary<string, UiClientContext> UiClientContexts { get; private set; }
 
         private readonly ConcurrentDictionary<string, UiClient> uiClients = new ConcurrentDictionary<string, UiClient>();
+
+        /// <summary>
+        /// Per-client transmit queues, used when <see cref="UsePerClientQueues"/> is on. Lazy so that
+        /// only one queue (and send task) is ever created per client, even if two threads race to
+        /// send its first message.
+        /// </summary>
+        private readonly ConcurrentDictionary<string, Lazy<ClientTransmitQueue>> clientQueues =
+            new ConcurrentDictionary<string, Lazy<ClientTransmitQueue>>();
 
         /// <summary>
         /// Stores pending client registrations using composite key: token-clientId
@@ -141,21 +148,24 @@ namespace PepperDash.Essentials.WebSocketServer
         public int Port { get; private set; }
 
         /// <summary>
+        /// Gets the HTTP scheme to use for generated URLs, based on whether the direct server is configured as secure
+        /// </summary>
+        private string HttpScheme => _parent.Config.DirectServer.Secure ? "https" : "http";
+
+        /// <summary>
+        /// Gets the WebSocket scheme to use for generated URLs, based on whether the direct server is configured as secure
+        /// </summary>
+        private string WsScheme => _parent.Config.DirectServer.Secure ? "wss" : "ws";
+
+        /// <summary>
         /// Gets the user app URL prefix
         /// </summary>
         public string UserAppUrlPrefix
         {
             get
             {
-                // The server itself only listens for TLS when DirectServer.Secure is set (see
-                // Initialize()'s sslConfig setup above) - this must follow that same flag rather
-                // than hardcoding http, or a secure server hands out a URL its own touchpanel
-                // clients embed in an HTTPS-hosted iframe, where it gets silently dropped as
-                // mixed content instead of ever loading.
-                var scheme = _parent.Config.DirectServer.Secure ? "https" : "http";
-
                 return string.Format("{0}://{1}:{2}{3}?token=",
-                    scheme,
+                    HttpScheme,
                     CrestronEthernetHelper.GetEthernetParameter(CrestronEthernetHelper.ETHERNET_PARAMETER_TO_GET.GET_CURRENT_IP_ADDRESS, 0),
                     Port,
                     _userAppBaseHref);
@@ -328,6 +338,347 @@ namespace PepperDash.Essentials.WebSocketServer
             CrestronConsole.AddNewConsoleCommand(RemoveAllTokens, "MobileRemoveAllClients", "Removes all clients", ConsoleAccessLevelEnum.AccessOperator);
         }
 
+        private struct AllowedNetwork
+        {
+            public byte[] Address;
+            public int PrefixLength;
+        }
+
+        // null = no filtering configured
+        private List<AllowedNetwork> _allowedNetworks;
+
+        // Last time a rate-limited message was logged, keyed by message kind + source address
+        private readonly ConcurrentDictionary<string, DateTime> _lastLogged = new ConcurrentDictionary<string, DateTime>();
+
+        private static readonly TimeSpan _logInterval = TimeSpan.FromSeconds(60);
+
+        private const int MaxLoggedPathLength = 200;
+
+        private const int MaxRateLimitEntries = 512;
+
+        /// <summary>
+        /// Parses allowedClientNetworks. Invalid entries are logged and skipped.
+        /// </summary>
+        private void LoadAllowedNetworks()
+        {
+            var configured = _parent.Config.DirectServer.AllowedClientNetworks;
+
+            if (configured == null || configured.Count == 0)
+            {
+                _allowedNetworks = null;
+                return;
+            }
+
+            var parsed = new List<AllowedNetwork>();
+
+            foreach (var entry in configured)
+            {
+                if (TryParseCidr(entry, out var network))
+                {
+                    parsed.Add(network);
+                    continue;
+                }
+
+                this.LogWarning("Ignoring invalid allowedClientNetworks entry '{entry}'. Expected CIDR notation like 192.168.10.0/24", entry);
+            }
+
+            _allowedNetworks = parsed;
+
+            this.LogInformation("Restricting HTTP clients to the Control Subnet, loopback and {count} configured network(s)", parsed.Count);
+        }
+
+        private static bool TryParseCidr(string value, out AllowedNetwork network)
+        {
+            network = default(AllowedNetwork);
+
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return false;
+            }
+
+            var parts = value.Trim().Split('/');
+
+            if (parts.Length > 2 || !System.Net.IPAddress.TryParse(parts[0], out var address))
+            {
+                return false;
+            }
+
+            var bytes = address.GetAddressBytes();
+            var prefix = bytes.Length * 8;
+
+            if (parts.Length == 2 && (!int.TryParse(parts[1], out prefix) || prefix < 0 || prefix > bytes.Length * 8))
+            {
+                return false;
+            }
+
+            // Clients in ::ffff:a.b.c.d form are compared as IPv4, so store a mapped entry the same way or it never matches
+            if (bytes.Length == 16 && prefix >= 96 && IsIPv4MappedBytes(bytes))
+            {
+                var v4 = new byte[4];
+                Array.Copy(bytes, 12, v4, 0, 4);
+                bytes = v4;
+                prefix -= 96;
+            }
+
+            network = new AllowedNetwork { Address = bytes, PrefixLength = prefix };
+            return true;
+        }
+
+        /// <summary>
+        /// True for ::ffff:a.b.c.d, the form an IPv4 client takes on a dual-stack listener.
+        /// </summary>
+        private static bool IsIPv4MappedBytes(byte[] bytes)
+        {
+            for (var i = 0; i < 10; i++)
+            {
+                if (bytes[i] != 0)
+                {
+                    return false;
+                }
+            }
+
+            return bytes[10] == 0xFF && bytes[11] == 0xFF;
+        }
+
+        private static bool IsInNetwork(byte[] remote, AllowedNetwork network)
+        {
+            if (remote.Length != network.Address.Length)
+            {
+                return false;
+            }
+
+            var fullBytes = network.PrefixLength / 8;
+            var remainingBits = network.PrefixLength % 8;
+
+            for (var i = 0; i < fullBytes; i++)
+            {
+                if (remote[i] != network.Address[i])
+                {
+                    return false;
+                }
+            }
+
+            if (remainingBits == 0)
+            {
+                return true;
+            }
+
+            var mask = (byte)(0xFF << (8 - remainingBits));
+            return (remote[fullBytes] & mask) == (network.Address[fullBytes] & mask);
+        }
+
+        /// <summary>
+        /// True if the address is on the processor's Control Subnet. Unwraps an IPv4-mapped IPv6 address first, and
+        /// only compares addresses of the same family, so an IPv6 client is never tested against the IPv4 Control
+        /// Subnet (IsInSameSubnet throws on a length mismatch).
+        /// </summary>
+        private bool IsOnControlSubnet(System.Net.IPAddress remote)
+        {
+            if (remote == null || csIpAddress == null || csSubnetMask == null)
+            {
+                return false;
+            }
+
+            var bytes = remote.GetAddressBytes();
+            if (bytes.Length == 16 && IsIPv4MappedBytes(bytes))
+            {
+                var v4 = new byte[4];
+                Array.Copy(bytes, 12, v4, 0, 4);
+                remote = new System.Net.IPAddress(v4);
+            }
+
+            return remote.AddressFamily == csIpAddress.AddressFamily && remote.IsInSameSubnet(csIpAddress, csSubnetMask);
+        }
+
+        /// <summary>
+        /// True if a request from this address should be served.
+        /// </summary>
+        private bool IsClientAllowed(System.Net.IPAddress remote)
+        {
+            if (_allowedNetworks == null)
+            {
+                return true;
+            }
+
+            if (remote == null)
+            {
+                return false;
+            }
+
+            var bytes = remote.GetAddressBytes();
+
+            // An IPv4 address can arrive as an IPv4-mapped IPv6 address (::ffff:a.b.c.d)
+            if (bytes.Length == 16 && IsIPv4MappedBytes(bytes))
+            {
+                var v4 = new byte[4];
+                Array.Copy(bytes, 12, v4, 0, 4);
+                bytes = v4;
+                remote = new System.Net.IPAddress(v4);
+            }
+
+            // After unwrapping: IsLoopback is false for ::ffff:127.0.0.1
+            if (System.Net.IPAddress.IsLoopback(remote))
+            {
+                return true;
+            }
+
+            if (IsOnControlSubnet(remote))
+            {
+                return true;
+            }
+
+            foreach (var network in _allowedNetworks)
+            {
+                if (IsInNetwork(bytes, network))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// The remote address, or null if the socket is already gone. Reading RemoteEndPoint on a connection the
+        /// client has already reset throws SocketException ("The socket is not connected") from inside the HTTP
+        /// stack - the ?. operator does not help, because the getter itself throws rather than returning null. A
+        /// scanner that resets every connection would otherwise log one exception and stack trace per request.
+        /// </summary>
+        private static System.Net.IPAddress TryGetRemoteAddress(HttpListenerRequest req)
+        {
+            try
+            {
+                return req.RemoteEndPoint?.Address;
+            }
+            catch (System.Net.Sockets.SocketException)
+            {
+                return null;
+            }
+            catch (ObjectDisposedException)
+            {
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Drops the connection without a response if the client is not allowed. Returns true if it was refused.
+        /// </summary>
+        private bool RejectIfNotAllowed(HttpListenerRequest req, HttpListenerResponse res)
+        {
+            var remote = TryGetRemoteAddress(req);
+
+            if (IsClientAllowed(remote))
+            {
+                return false;
+            }
+
+            LogRateLimited("rejected", remote, () =>
+                this.LogWarning("Refused HTTP request from {host}: not in the Control Subnet or allowedClientNetworks", remote));
+
+            DropConnection(res);
+            return true;
+        }
+
+        /// <summary>
+        /// Closes the connection without writing a response.
+        /// </summary>
+        /// <remarks>
+        /// Used for requests we are refusing. Writing even a short reply means a send on a socket the other end
+        /// may already have reset, which throws from inside the HTTP stack (seen in the field as
+        /// "Unable to write data to the transport connection: Connection reset by peer" from
+        /// HttpListenerResponse.Close). Abort() writes nothing, so there is nothing to fail.
+        /// </remarks>
+        private void DropConnection(HttpListenerResponse res)
+        {
+            try
+            {
+                res.Abort();
+            }
+            catch (Exception ex)
+            {
+                // The connection is already gone, which is the outcome we wanted
+                this.LogDebug("Exception dropping connection: {message}", ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// Runs the log action at most once per interval for each (kind, address) pair, so that a scan
+        /// producing hundreds of requests cannot flood the log.
+        /// </summary>
+        private void LogRateLimited(string kind, System.Net.IPAddress remote, Action log)
+        {
+            var key = kind + "|" + (remote?.ToString() ?? "unknown");
+            var now = DateTime.UtcNow;
+
+            // Check and update together, or a burst of concurrent requests from one source would each see a
+            // stale timestamp and all log
+            lock (_lastLogged)
+            {
+                if (_lastLogged.TryGetValue(key, out var last))
+                {
+                    // Seen recently: stay quiet until this source's window passes.
+                    if (now - last < _logInterval)
+                    {
+                        return;
+                    }
+                }
+                else if (_lastLogged.Count >= MaxRateLimitEntries)
+                {
+                    // Cache full. Drop only entries whose window has already passed - never an active one.
+                    // Clearing the whole cache would reset every source's limit, so a scan from many
+                    // addresses would fill it, flush it, and log all over again each cycle.
+                    foreach (var expired in _lastLogged.Where(kv => now - kv.Value >= _logInterval).Select(kv => kv.Key).ToList())
+                    {
+                        _lastLogged.TryRemove(expired, out _);
+                    }
+
+                    // Still full means more than MaxRateLimitEntries distinct sources are inside their window
+                    // right now. Suppress this new source rather than evict an active one.
+                    if (_lastLogged.Count >= MaxRateLimitEntries)
+                    {
+                        return;
+                    }
+                }
+
+                _lastLogged[key] = now;
+            }
+
+            log();
+        }
+
+        private static string TruncateForLog(string value)
+        {
+            if (value == null || value.Length <= MaxLoggedPathLength)
+            {
+                return value;
+            }
+
+            return value.Substring(0, MaxLoggedPathLength) + "...(" + value.Length + " chars)";
+        }
+
+        /// <summary>
+        /// Requests that every ordinary browser makes and this server has never answered.
+        /// </summary>
+        /// <remarks>
+        /// The app's index.html sets its own &lt;base&gt; from an inline script, but the browser's preload
+        /// scanner requests ./assets/* first, relative to /mc/, so each page load asks for /mc/assets/* and gets a
+        /// 404 before the real requests succeed under /mc/app/assets/. Browsers also ask for /favicon.ico. These
+        /// are expected, so they are not logged as unrecognised paths.
+        /// </remarks>
+        private static bool IsBenignBrowserRequest(string path)
+        {
+            if (string.IsNullOrEmpty(path))
+            {
+                return false;
+            }
+
+            var queryStart = path.IndexOf('?');
+            var withoutQuery = queryStart >= 0 ? path.Substring(0, queryStart) : path;
+
+            return withoutQuery.StartsWith("/mc/assets/", StringComparison.Ordinal)
+                || string.Equals(withoutQuery, "/favicon.ico", StringComparison.OrdinalIgnoreCase);
+        }
+
 
         /// <summary>
         /// Initialize method
@@ -339,32 +690,34 @@ namespace PepperDash.Essentials.WebSocketServer
             {
                 base.Initialize();
 
-                ServerSslConfiguration sslConfig = null;
+                LoadAllowedNetworks();
 
-                if (_parent.Config.DirectServer.Secure)
-                {
-                    this.LogInformation("Adding SSL Configuration to server");
-                    sslConfig = new ServerSslConfiguration(new X509Certificate2($"\\user\\{certificateName}.pfx", certificatePassword))
-                    {
-                        ClientCertificateRequired = false,
-                        CheckCertificateRevocation = false,
-                        EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13
-                    };
-                }
-
-                _server = new HttpServer(Port, false);
-                if (sslConfig != null)
-                {
-                    _server.SslConfiguration.ServerCertificate = sslConfig.ServerCertificate;
-                }
+                _server = new HttpServer(Port, _parent.Config.DirectServer.Secure);
 
                 _server.OnGet += Server_OnGet;
 
                 _server.OnOptions += Server_OnOptions;
 
-                if (_parent.Config.DirectServer.Logging.EnableRemoteLogging)
+                // Always subscribed so POST requests go through the allowlist; log forwarding is gated inside
+                _server.OnPost += Server_OnPost;
+
+                if (_parent.Config.DirectServer.Secure)
                 {
-                    _server.OnPost += Server_OnPost;
+                    this.LogInformation("Adding SSL Configuration to server");
+
+                    // Configure in place rather than assigning a new ServerSslConfiguration:
+                    // HttpServer.SslConfiguration is read-only in the websocket-sharp version
+                    // this branch builds against. Reading it is only valid because the server
+                    // above was constructed secure - it throws otherwise.
+                    // The shared certificate's path for this platform: /user on a 4-series, the room's user
+                    // folder on VC-4. It uses the runtime's separator, which is '/' on both (both are Linux);
+                    // OpenSSL does not translate a Windows-style path, and the backslash form fails with
+                    // "error:10000080:BIO routines::no such file" and takes the whole direct server down.
+                    _server.SslConfiguration.ServerCertificate =
+                        new X509Certificate2(PepperDash.Core.Web.ProcessorCertificate.FilePath, certificatePassword, X509KeyStorageFlags.EphemeralKeySet);
+                    _server.SslConfiguration.ClientCertificateRequired = false;
+                    _server.SslConfiguration.CheckCertificateRevocation = false;
+                    _server.SslConfiguration.EnabledSslProtocols = SslProtocols.Tls12;
                 }
 
                 _server.Log.Output = (data, message) => Utilities.ConvertWebsocketLog(data, message, this);
@@ -474,19 +827,15 @@ namespace PepperDash.Essentials.WebSocketServer
                     ip = csIpAddress.ToString();
                 }
 
-                // Must follow DirectServer.Secure like the server's own Initialize() does (see
-                // UserAppUrlPrefix above for the same fix) - a secure server handing out an http
-                // URL gets embedded in the touchpanel wrapper app's HTTPS-hosted iframe, where
-                // it's silently dropped as mixed content instead of ever loading.
-                var scheme = _parent.Config.DirectServer.Secure ? "https" : "http";
-
                 // The bundle stamp goes after the token: every consumer of this URL parses the query
                 // properly (HandleJoinRequest via req.QueryString, the react app core via
                 // URLSearchParams, the wrapper app via URL), and the panel controller's IP rewrite only
                 // touches the host. See UserAppBundleStamp for why it is here at all.
                 var bundleQuery = string.IsNullOrEmpty(UserAppBundleStamp) ? string.Empty : $"&bundle={UserAppBundleStamp}";
 
-                var appUrl = $"{scheme}://{ip}:{_parent.Config.DirectServer.Port}/mc/app/?token={touchpanel.Key}{bundleQuery}";
+                // The trailing slash on /mc/app/ makes the browser resolve the app's relative ./assets/*
+                // under /mc/app/ from the first request, instead of /mc/assets/* (see IsBenignBrowserRequest).
+                var appUrl = $"{HttpScheme}://{ip}:{_parent.Config.DirectServer.Port}/mc/app/?token={touchpanel.Key}{bundleQuery}";
 
                 this.LogVerbose("Sending URL {appUrl} to touchpanel {touchpanelKey}", appUrl, touchpanel.Touchpanel.Key);
 
@@ -713,13 +1062,9 @@ namespace PepperDash.Essentials.WebSocketServer
         {
             try
             {
-                // Must follow DirectServer.Secure like the server's own Initialize() does - see
-                // UserAppUrlPrefix for the same fix.
-                var scheme = _parent.Config.DirectServer.Secure ? "https" : "http";
-
                 var config = new MobileControlApplicationConfig
                 {
-                    ApiPath = string.Format("{0}://{1}:{2}/mc/api", scheme, processorIp, _parent.Config.DirectServer.Port),
+                    ApiPath = string.Format("{0}://{1}:{2}/mc/api", HttpScheme, processorIp, _parent.Config.DirectServer.Port),
                     GatewayAppPath = "",
                     LogoPath = _parent.Config.ApplicationConfig?.LogoPath ?? "logo/logo.png",
                     EnableDev = _parent.Config.ApplicationConfig?.EnableDev ?? false,
@@ -737,7 +1082,12 @@ namespace PepperDash.Essentials.WebSocketServer
                         }
                     },
                     Logging = _parent.Config.ApplicationConfig?.Logging ?? false,
-                    PartnerMetadata = _parent.Config.ApplicationConfig?.PartnerMetadata ?? new List<MobileControlPartnerMetadata>()
+                    PartnerMetadata = _parent.Config.ApplicationConfig?.PartnerMetadata ?? new List<MobileControlPartnerMetadata>(),
+                    LockoutMessagesByTouchpanel = _parent.Config.ApplicationConfig?.LockoutMessagesByTouchpanel ?? new Dictionary<string, MobileControlLockoutMessageOverride>(),
+                    // App-specific settings Essentials doesn't model, passed through unchanged
+                    AdditionalProperties = _parent.Config.ApplicationConfig?.AdditionalProperties != null
+                        ? new Dictionary<string, JToken>(_parent.Config.ApplicationConfig.AdditionalProperties)
+                        : null
                 };
 
                 return config;
@@ -768,8 +1118,8 @@ namespace PepperDash.Essentials.WebSocketServer
                 {
                     Debug.LogMessage(LogEventLevel.Information, "Secret successfully retrieved", this);
 
-                    Debug.LogMessage(LogEventLevel.Debug, "Secret: {0}", this, secret.Value.ToString());
-
+                    // The secret document holds the server grant code and every paired touchpanel
+                    // token, so it must never be logged. The line above already records success.
 
                     // populate the local secrets object
                     _secret = JsonConvert.DeserializeObject<ServerTokenSecrets>(secret.Value.ToString());
@@ -1004,6 +1354,7 @@ namespace PepperDash.Essentials.WebSocketServer
             c.ConnectionClosed += (o, a) =>
             {
                 uiClients.TryRemove(a.ClientId, out _);
+                RemoveClientQueue(a.ClientId);
                 // Clean up any pending registrations for this token
                 var keysToRemove = pendingClientRegistrations.Keys
                     .Where(k => k.StartsWith($"{key}-"))
@@ -1085,6 +1436,11 @@ namespace PepperDash.Essentials.WebSocketServer
                 this.LogWarning("Cannot find client with old ID {oldClientId}", oldClientId);
                 return false;
             }
+
+            // Messages queued under the old ID can't be delivered once it changes; a queue for the new
+            // ID is created on its first message. Removed after the client, so a message for the old ID
+            // racing this sees no client and removes any queue it makes (see EnqueueForClient).
+            RemoveClientQueue(oldClientId);
 
             // Update the client's ID
             client.UpdateId(newClientId);
@@ -1258,6 +1614,18 @@ namespace PepperDash.Essentials.WebSocketServer
         }
 
         /// <summary>
+        /// Adds headers to a response telling the client not to cache it. Some panel browsers hold on to
+        /// a cached copy of the app and never re-request it, which leaves them running a stale build.
+        /// </summary>
+        /// <param name="res">The response to add the headers to</param>
+        private static void AddNoCacheHeaders(HttpListenerResponse res)
+        {
+            res.AddHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+            res.AddHeader("Pragma", "no-cache");
+            res.AddHeader("Expires", "0");
+        }
+
+        /// <summary>
         /// Handler for GET requests to server
         /// </summary>
         /// <param name="sender"></param>
@@ -1268,13 +1636,24 @@ namespace PepperDash.Essentials.WebSocketServer
             {
                 var req = e.Request;
                 var res = e.Response;
+
+                if (RejectIfNotAllowed(req, res))
+                {
+                    return;
+                }
+
                 res.ContentEncoding = Encoding.UTF8;
 
                 res.AddHeader("Access-Control-Allow-Origin", "*");
 
-                var path = req.RawUrl;
+                AddNoCacheHeaders(res);
 
-                this.LogVerbose("GET Request received at path: {path}", path);
+                var path = req.RawUrl;
+                var remote = TryGetRemoteAddress(req);
+
+                // Source address included so a scan can be attributed to a host. Path is truncated
+                // because a hostile request can carry an arbitrarily long one.
+                this.LogVerbose("GET Request received at path: {path} from host {host}", TruncateForLog(path), remote);
 
                 // Call for user app to join the room with a token
                 if (path.StartsWith("/mc/api/ui/joinroom"))
@@ -1297,9 +1676,25 @@ namespace PepperDash.Essentials.WebSocketServer
                 }
                 else
                 {
-                    // All other paths
-                    res.StatusCode = 404;
-                    res.Close();
+                    // All other paths. Browsers make a couple of these on every page load, so those are not
+                    // logged at Information.
+                    if (!IsBenignBrowserRequest(path))
+                    {
+                        LogRateLimited("unrecognised", remote, () =>
+                            this.LogInformation("Unrecognised request path from {host}: {path}", remote, TruncateForLog(path)));
+                    }
+
+                    if (_parent.Config.DirectServer.DropUnrecognisedRequests == true)
+                    {
+                        // No reply: nothing legitimate asks for these paths, and a reply is a write that can
+                        // fail on a connection the client has already reset
+                        DropConnection(res);
+                    }
+                    else
+                    {
+                        res.StatusCode = 404;
+                        res.Close();
+                    }
                 }
             }
             catch (Exception ex)
@@ -1316,17 +1711,34 @@ namespace PepperDash.Essentials.WebSocketServer
                 var req = e.Request;
                 var res = e.Response;
 
+                if (RejectIfNotAllowed(req, res))
+                {
+                    return;
+                }
+
                 res.AddHeader("Access-Control-Allow-Origin", "*");
 
+                AddNoCacheHeaders(res);
+
                 var path = req.RawUrl;
-                var ip = req.RemoteEndPoint.Address.ToString();
+                var remote = TryGetRemoteAddress(req);
+                var ip = remote?.ToString();
 
-                this.LogVerbose("POST Request received at path: {path} from host {host}", path, ip);
-
-                var body = new StreamReader(req.InputStream).ReadToEnd();
+                this.LogVerbose("POST Request received at path: {path} from host {host}", TruncateForLog(path), ip);
 
                 if (path.StartsWith("/mc/api/log"))
                 {
+                    // The app posts here whether or not forwarding is on, so this is not an unwanted request.
+                    // Acknowledged without reading the body, so a large or slow upload costs nothing when it is off.
+                    if (!_parent.Config.DirectServer.Logging.EnableRemoteLogging)
+                    {
+                        res.StatusCode = 200;
+                        res.Close();
+                        return;
+                    }
+
+                    var body = new StreamReader(req.InputStream).ReadToEnd();
+
                     res.StatusCode = 200;
                     res.Close();
 
@@ -1343,8 +1755,19 @@ namespace PepperDash.Essentials.WebSocketServer
                 }
                 else
                 {
-                    res.StatusCode = 404;
-                    res.Close();
+                    // Treated like an unrecognised GET: logged, then dropped or 404
+                    LogRateLimited("unrecognised", remote, () =>
+                        this.LogInformation("Unrecognised POST path from {host}: {path}", remote, TruncateForLog(path)));
+
+                    if (_parent.Config.DirectServer.DropUnrecognisedRequests == true)
+                    {
+                        DropConnection(res);
+                    }
+                    else
+                    {
+                        res.StatusCode = 404;
+                        res.Close();
+                    }
                 }
             }
             catch (Exception ex)
@@ -1359,9 +1782,16 @@ namespace PepperDash.Essentials.WebSocketServer
             {
                 var res = e.Response;
 
+                if (RejectIfNotAllowed(e.Request, res))
+                {
+                    return;
+                }
+
                 res.AddHeader("Access-Control-Allow-Origin", "*");
                 res.AddHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
                 res.AddHeader("Access-Control-Allow-Headers", "Content-Type, Accept, X-Requested-With, remember-me");
+
+                AddNoCacheHeaders(res);
 
                 res.StatusCode = 200;
                 res.Close();
@@ -1461,14 +1891,8 @@ namespace PepperDash.Essentials.WebSocketServer
 
             this.LogVerbose("Assigning ClientId: {clientId} for token: {token} at {timestamp}", clientId, token, now);
 
-            // Construct WebSocket URL with clientId query parameter. Both this and UserAppUrl
-            // below must follow DirectServer.Secure like the server's own Initialize() does (see
-            // UserAppUrlPrefix and AddClientsForTouchpanels for the same fix) - a secure server
-            // handing out ws:// or http:// URLs breaks clients loaded over https, which refuse
-            // the insecure connection/frame instead of ever completing it.
-            var httpScheme = _parent.Config.DirectServer.Secure ? "https" : "http";
-            var wsProtocol = _parent.Config.DirectServer.Secure ? "wss" : "ws";
-            var wsUrl = $"{wsProtocol}://{CrestronEthernetHelper.GetEthernetParameter(CrestronEthernetHelper.ETHERNET_PARAMETER_TO_GET.GET_CURRENT_IP_ADDRESS, 0)}:{Port}{_wsPath}{token}?clientId={clientId}";
+            // Construct WebSocket URL with clientId query parameter
+            var wsUrl = $"{WsScheme}://{CrestronEthernetHelper.GetEthernetParameter(CrestronEthernetHelper.ETHERNET_PARAMETER_TO_GET.GET_CURRENT_IP_ADDRESS, 0)}:{Port}{_wsPath}{token}?clientId={clientId}";
 
             // Construct the response object
             JoinResponse jRes = new JoinResponse
@@ -1481,7 +1905,7 @@ namespace PepperDash.Essentials.WebSocketServer
                 CodeExpires = new DateTime().AddYears(1),
                 UserCode = bridge.UserCode,
                 UserAppUrl = string.Format("{0}://{1}:{2}/mc/app/",
-                httpScheme,
+                HttpScheme,
                 CrestronEthernetHelper.GetEthernetParameter(CrestronEthernetHelper.ETHERNET_PARAMETER_TO_GET.GET_CURRENT_IP_ADDRESS, 0),
                 Port),
                 WebSocketUrl = wsUrl,
@@ -1611,7 +2035,10 @@ namespace PepperDash.Essentials.WebSocketServer
             //string filePath = path.Replace(string.Format("?token={0}", token), "");
 
             // if there's no file suffix strip any extra path data after the base href
-            if (filePath != _userAppBaseHref && !filePath.Contains(".") && (!filePath.EndsWith(_userAppBaseHref) || !filePath.EndsWith(_userAppBaseHref += "/")))
+            // Note: this used to be `_userAppBaseHref += "/"` inside the condition, which silently appended a
+            // slash to the shared field the first time it was evaluated and changed every later request's
+            // path handling. Compare against a copy instead.
+            if (filePath != _userAppBaseHref && !filePath.Contains(".") && (!filePath.EndsWith(_userAppBaseHref) || !filePath.EndsWith(_userAppBaseHref + "/")))
             {
                 var suffix = filePath.Substring(_userAppBaseHref.Length, filePath.Length - _userAppBaseHref.Length);
                 if (suffix != "/")
@@ -1685,10 +2112,10 @@ namespace PepperDash.Essentials.WebSocketServer
 
             this.LogVerbose("Attempting to serve file: {filePath}", filePath);
 
-            var remoteIp = req.RemoteEndPoint.Address;
+            var remoteIp = TryGetRemoteAddress(req);
 
             // Check if the request is coming from the CS LAN and if so, send the CS config instead of the LAN config
-            if (csSubnetMask != null && csIpAddress != null && remoteIp.IsInSameSubnet(csIpAddress, csSubnetMask) && filePath.Contains(appConfigFileName))
+            if (IsOnControlSubnet(remoteIp) && filePath.Contains(appConfigFileName))
             {
                 filePath = filePath.Replace(appConfigFileName, appConfigCsFileName);
             }
@@ -1748,6 +2175,136 @@ namespace PepperDash.Essentials.WebSocketServer
         }
 
         /// <summary>
+        /// Whether each client has its own transmit queue (<c>directServer.perClientQueues</c>).
+        /// </summary>
+        public bool UsePerClientQueues => _parent.Config.DirectServer?.PerClientQueues == true;
+
+        /// <summary>
+        /// Queues a message for one client's own transmit task. Never blocks.
+        /// </summary>
+        public void EnqueueToClient(string clientId, OutboundClientMessage message)
+        {
+            if (clientId == null)
+            {
+                return;
+            }
+
+            if (!uiClients.ContainsKey(clientId))
+            {
+                this.LogWarning("Unable to find client with ID: {clientId}", clientId);
+                return;
+            }
+
+            EnqueueForClient(clientId, message);
+        }
+
+        /// <summary>
+        /// Queues a message for every connected client's own transmit task. Never blocks.
+        /// </summary>
+        public void EnqueueToAllClients(OutboundClientMessage message)
+        {
+            foreach (var client in uiClients)
+            {
+                if (!IsOpen(client.Value))
+                {
+                    continue;
+                }
+
+                EnqueueForClient(client.Key, message);
+            }
+        }
+
+        /// <summary>
+        /// Most messages a client's queue holds. A client this far behind has stopped reading; it is
+        /// disconnected rather than left to grow its queue without limit, and resyncs when it reconnects.
+        /// </summary>
+        private const int ClientQueueCapacity = 1000;
+
+        private void EnqueueForClient(string clientId, OutboundClientMessage message)
+        {
+            var queue = GetClientQueue(clientId);
+            queue.Value.Enqueue(message);
+
+            // The client may have disconnected after the caller found it, and its cleanup may have run
+            // before GetClientQueue made this queue. Nothing would remove it then, so remove it here.
+            if (!uiClients.ContainsKey(clientId))
+            {
+                RemoveClientQueue(clientId, queue);
+            }
+        }
+
+        private Lazy<ClientTransmitQueue> GetClientQueue(string clientId) =>
+            clientQueues.GetOrAdd(clientId, id => new Lazy<ClientTransmitQueue>(() => new ClientTransmitQueue(
+                send: payload =>
+                {
+                    // Look the client up at send time, so a reconnect or ID change is picked up.
+                    if (uiClients.TryGetValue(id, out var client))
+                    {
+                        client.Context.WebSocket.Send(payload);
+                    }
+                },
+                canSend: () => uiClients.TryGetValue(id, out var client) && IsOpen(client),
+                onSent: (message, queueMs, sendMs) =>
+                {
+                    if (message.Type == "/system/initialSyncComplete" || message.Type == "/system/batchDeviceStatus")
+                    {
+                        this.LogDebug("Perf: {type} sent to client {clientId} after {queueMs:F1} ms in its own transmit queue ({serializeMs:F1} ms to serialize, {sendMs:F1} ms to send, {length} chars)",
+                            message.Type, id, queueMs, message.SerializeMs, sendMs, message.Payload.Length);
+                    }
+                },
+                onError: ex => this.LogError("Error sending to client {clientId}: {message}", id, ex.Message),
+                onDropped: message => this.LogWarning("Dropped {type} for client {clientId}: its connection is not open",
+                    message.Type ?? "message", id),
+                capacity: ClientQueueCapacity,
+                onOverflow: () => DisconnectLaggingClient(id))));
+
+        private void DisconnectLaggingClient(string clientId)
+        {
+            this.LogWarning("Client {clientId} has {count} messages waiting and isn't keeping up; disconnecting it so it reconnects and resyncs",
+                clientId, ClientQueueCapacity);
+
+            if (uiClients.TryGetValue(clientId, out var client))
+            {
+                // Async: a client this far behind may not complete a close handshake promptly.
+                client.Context.WebSocket.CloseAsync(CloseStatusCode.Away, "Too far behind; reconnect to resync");
+            }
+        }
+
+        /// <summary>
+        /// Whether a client's connection is open, without the network round trip of
+        /// <c>WebSocket.IsAlive</c>.
+        /// </summary>
+        /// <remarks>
+        /// <c>IsAlive</c> sends a ping and blocks until the pong arrives, giving up after a second. Called
+        /// before every message, that adds a round trip per message (188 for a typical non-aggregated batch
+        /// sync, which made it about four times slower), and while the processor is busy a late pong makes a
+        /// connected client look disconnected, so its messages are dropped. Connections that die without
+        /// closing are still cleaned up by websocket-sharp's once-a-minute sweep.
+        /// </remarks>
+        private static bool IsOpen(UiClient client) =>
+            client?.Context?.WebSocket?.ReadyState == WebSocketState.Open;
+
+        private void RemoveClientQueue(string clientId)
+        {
+            if (clientId != null && clientQueues.TryRemove(clientId, out var queue) && queue.IsValueCreated)
+            {
+                queue.Value.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Removes <paramref name="queue"/> only if it is still the queue registered for the client.
+        /// </summary>
+        private void RemoveClientQueue(string clientId, Lazy<ClientTransmitQueue> queue)
+        {
+            var entry = new KeyValuePair<string, Lazy<ClientTransmitQueue>>(clientId, queue);
+            if (((ICollection<KeyValuePair<string, Lazy<ClientTransmitQueue>>>)clientQueues).Remove(entry) && queue.IsValueCreated)
+            {
+                queue.Value.Dispose();
+            }
+        }
+
+        /// <summary>
         /// Sends a message to all connectd clients
         /// </summary>
         /// <param name="message"></param>
@@ -1758,7 +2315,12 @@ namespace PepperDash.Essentials.WebSocketServer
         {
             foreach (var client in uiClients.Values)
             {
-                TrySend(client.Id, client.Context.WebSocket, message);
+                if (!IsOpen(client))
+                {
+                    continue;
+                }
+
+                client.Context.WebSocket.Send(message);
             }
         }
 
@@ -1779,42 +2341,18 @@ namespace PepperDash.Essentials.WebSocketServer
 
             if (uiClients.TryGetValue((string)clientId, out var client))
             {
-                TrySend(client.Id, client.Context.WebSocket, message);
+                var socket = client.Context.WebSocket;
+
+                if (!IsOpen(client))
+                {
+                    this.LogError("Unable to send message to client {id}. Client is disconnected: {message}", clientId, message);
+                    return;
+                }
+                socket.Send(message);
             }
             else
             {
                 this.LogWarning("Unable to find client with ID: {clientId}", clientId);
-            }
-        }
-
-        /// <summary>
-        /// Sends on an open socket, dropping the message only when the socket is genuinely not open.
-        /// </summary>
-        /// <remarks>
-        /// This used to gate on WebSocket.IsAlive, which in websocket-sharp is not a status flag: it
-        /// sends a ping and returns false unless the pong arrives within about a second. A browser busy
-        /// re-rendering (the In Session page right after Begin Session, for instance) can miss that
-        /// window on a perfectly good connection, so the server logged "Client is disconnected" and
-        /// silently dropped the very state message the client was waiting for - seen live at Reston:
-        /// the room entered In Session while the UI fell back to the Lobby. ReadyState reflects the
-        /// real connection state; a socket that has actually died raises OnClose, and a send that
-        /// fails anyway is logged rather than pre-empted by a ping.
-        /// </remarks>
-        private void TrySend(string clientId, WebSocket socket, string message)
-        {
-            if (socket == null || socket.ReadyState != WebSocketState.Open)
-            {
-                this.LogWarning("Unable to send message to client {id}: socket state is {state}", clientId, socket?.ReadyState);
-                return;
-            }
-
-            try
-            {
-                socket.Send(message);
-            }
-            catch (Exception ex)
-            {
-                this.LogWarning("Send to client {id} failed: {message}", clientId, ex.Message);
             }
         }
     }

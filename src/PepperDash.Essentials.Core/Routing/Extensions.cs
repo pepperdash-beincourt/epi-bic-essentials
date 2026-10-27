@@ -1,6 +1,5 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Linq;
 using PepperDash.Essentials.Core.Queues;
 using PepperDash.Essentials.Core.Routing;
@@ -32,7 +31,8 @@ public static class Extensions
         {
             { eRoutingSignalType.Audio, new RouteDescriptorCollection() },
             { eRoutingSignalType.Video, new RouteDescriptorCollection() },
-            { eRoutingSignalType.AudioVideo, new RouteDescriptorCollection() }
+            { eRoutingSignalType.AudioVideo, new RouteDescriptorCollection() },
+            { eRoutingSignalType.Usb, new RouteDescriptorCollection() }
         };
 
     /// <summary>
@@ -147,9 +147,7 @@ public static class Extensions
     /// </summary>        
     public static void ReleaseAndMakeRoute(this IRoutingInputs destination, IRoutingOutputs source, eRoutingSignalType signalType, string destinationPortKey = "", string sourcePortKey = "")
     {
-        // Remove this line before committing!!!!!
-        var frame = new StackFrame(1, true);
-        Debug.LogMessage(LogEventLevel.Information, "ReleaseAndMakeRoute Called from {method} with params {destinationKey}:{sourceKey}:{signalType}:{destinationPortKey}:{sourcePortKey}", frame.GetMethod().Name, destination.Key, source.Key, signalType.ToString(), destinationPortKey, sourcePortKey);
+        Debug.LogMessage(LogEventLevel.Debug, "ReleaseAndMakeRoute with params {destinationKey}:{sourceKey}:{signalType}:{destinationPortKey}:{sourcePortKey}", null, destination.Key, source.Key, signalType.ToString(), destinationPortKey, sourcePortKey);
 
         var inputPort = string.IsNullOrEmpty(destinationPortKey) ? null : destination.InputPorts.FirstOrDefault(p => p.Key == destinationPortKey);
         var outputPort = string.IsNullOrEmpty(sourcePortKey) ? null : source.OutputPorts.FirstOrDefault(p => p.Key == sourcePortKey);
@@ -412,20 +410,27 @@ public static class Extensions
 
             Debug.LogMessage(LogEventLevel.Verbose, "Executing full route", request.Destination);
 
-            audioOrSingleRoute.ExecuteRoutes();
+            // Either half may legitimately be null: GetRouteToSource splits an AudioVideo request
+            // into independent audio and video searches and returns whichever succeeded, so a
+            // video-only source asked for AudioVideo yields (null, videoRoute). Without the
+            // null-conditional here that threw, and the catch below swallowed it - so the video
+            // half never executed and the route silently did nothing.
+            audioOrSingleRoute?.ExecuteRoutes();
             videoRoute?.ExecuteRoutes();
 
-            // Update ICurrentSources on the destination if it implements the interface
+            // Update ICurrentSources on the destination if it implements the interface.
+            // Only record the halves that actually routed - claiming an audio source that has no
+            // audio path would misreport what the destination is receiving.
             if (request.Destination is ICurrentSources currentSourcesDevice && request.Source is IRoutingSource routingSource)
             {
-                if (request.SignalType.HasFlag(eRoutingSignalType.Audio) || request.SignalType.HasFlag(eRoutingSignalType.AudioVideo))
+                if (audioOrSingleRoute != null)
                 {
-                    currentSourcesDevice.SetCurrentSource(eRoutingSignalType.Audio, routingSource);
+                    currentSourcesDevice.SetCurrentSource(audioOrSingleRoute.SignalType, routingSource);
                 }
 
-                if (request.SignalType.HasFlag(eRoutingSignalType.Video) || request.SignalType.HasFlag(eRoutingSignalType.AudioVideo))
+                if (videoRoute != null)
                 {
-                    currentSourcesDevice.SetCurrentSource(eRoutingSignalType.Video, routingSource);
+                    currentSourcesDevice.SetCurrentSource(videoRoute.SignalType, routingSource);
                 }
             }
         }
@@ -456,26 +461,30 @@ public static class Extensions
 
             RouteRequests.Remove(destination.Key);
 
-            var current = RouteDescriptorCollection.DefaultCollection.RemoveRouteDescriptor(destination, inputPortKey);
-            if (current != null)
+            // An AudioVideo route is stored as separate Audio and Video descriptors. Release all of
+            // them: releasing only the first orphans the other, so later releases act on a stale
+            // route and its output ports never drop out of use.
+            var current = RouteDescriptorCollection.DefaultCollection.RemoveRouteDescriptors(destination, inputPortKey);
+            var releasedSignalTypes = default(eRoutingSignalType);
+
+            foreach (var descriptor in current)
             {
-                Debug.LogMessage(LogEventLevel.Information, "Releasing current route: {0}", destination, current.Source.Key);
-                current.ReleaseRoutes(clearRoute);
+                Debug.LogMessage(LogEventLevel.Information, "Releasing current route: {source} ({signalType})", destination, descriptor.Source.Key, descriptor.SignalType);
+                descriptor.ReleaseRoutes(clearRoute);
+                releasedSignalTypes |= descriptor.SignalType;
             }
 
             // Clear ICurrentSources on the destination if clearing the route
             if (clearRoute && destination is ICurrentSources currentSourcesDevice)
             {
-                if (current != null)
+                if (current.Count > 0)
                 {
-                    var signalType = current.SignalType;
-
-                    if (signalType.HasFlag(eRoutingSignalType.Audio) || signalType.HasFlag(eRoutingSignalType.AudioVideo))
+                    if (releasedSignalTypes.HasFlag(eRoutingSignalType.Audio))
                     {
                         currentSourcesDevice.SetCurrentSource(eRoutingSignalType.Audio, null);
                     }
 
-                    if (signalType.HasFlag(eRoutingSignalType.Video) || signalType.HasFlag(eRoutingSignalType.AudioVideo))
+                    if (releasedSignalTypes.HasFlag(eRoutingSignalType.Video))
                     {
                         currentSourcesDevice.SetCurrentSource(eRoutingSignalType.Video, null);
                     }
@@ -518,21 +527,31 @@ public static class Extensions
                     {
                         foreach (var outputPort in source.OutputPorts)
                         {
-                            var (audioOrSingleRoute, videoRoute) = sink.GetRouteToSource(source, inputPort.Type, inputPort, outputPort);
+                            // Only the signal types both ends support can flow between them. Asking for the
+                            // input's type alone made a Video-only output look like a candidate for an
+                            // AudioVideo input's audio route.
+                            var signalType = inputPort.Type & outputPort.Type;
+
+                            if (signalType == 0)
+                            {
+                                continue;
+                            }
+
+                            var (audioOrSingleRoute, videoRoute) = sink.GetRouteToSource(source, signalType, inputPort, outputPort);
 
                             if (audioOrSingleRoute == null && videoRoute == null)
                             {
                                 continue;
                             }
 
-                            if (audioOrSingleRoute != null)
-                            {
-                                // Only add routes that have actual switching steps
-                                if (audioOrSingleRoute.Routes == null || audioOrSingleRoute.Routes.Count == 0)
-                                {
-                                    continue;
-                                }
+                            Debug.LogVerbose("Route mapped: {source}:{output} -> {sink}:{input}, audio/single: {audioRoute}, video: {videoRoute}",
+                                source.Key, outputPort.Key, sink.Key, inputPort.Key, audioOrSingleRoute, videoRoute);
 
+                            // The audio (or single-type) and video descriptors are independent: an AudioVideo request
+                            // can find a video path and no audio path, and that video route must still be registered.
+                            // Only add routes that have actual switching steps.
+                            if (audioOrSingleRoute?.Routes != null && audioOrSingleRoute.Routes.Count > 0)
+                            {
                                 // Add to the appropriate collection(s) based on signal type
                                 // Note: A single route descriptor with combined flags (e.g., AudioVideo) will be added once per matching signal type
                                 if (audioOrSingleRoute.SignalType.HasFlag(eRoutingSignalType.Audio))
@@ -547,16 +566,11 @@ public static class Extensions
                                 {
                                     RouteDescriptors[eRoutingSignalType.Usb].AddRouteDescriptor(audioOrSingleRoute);
                                 }
-                                if (videoRoute != null)
-                                {
-                                    // Only add routes that have actual switching steps
-                                    if (videoRoute.Routes == null || videoRoute.Routes.Count == 0)
-                                    {
-                                        continue;
-                                    }
+                            }
 
-                                    RouteDescriptors[eRoutingSignalType.Video].AddRouteDescriptor(videoRoute);
-                                }
+                            if (videoRoute?.Routes != null && videoRoute.Routes.Count > 0)
+                            {
+                                RouteDescriptors[eRoutingSignalType.Video].AddRouteDescriptor(videoRoute);
                             }
                         }
                     }
@@ -706,13 +720,30 @@ public static class Extensions
             // it's a sink device
             routeTable.Routes.Add(new RouteSwitchDescriptor(goodInputPort));
         }
-        else if (destination is IRoutingMidpointWithFeedback)
+        else if (destination is IRoutingMidpointWithFeedback midpoint)
         {
-            routeTable.Routes.Add(new RouteSwitchDescriptor(outputPortToUse, goodInputPort));
+            // outputPortToUse is only null when the midpoint is the route's terminal destination, so no
+            // downstream device asked for a particular output. Keep the hop so the midpoint still selects
+            // its input, and use its output only when that choice is unambiguous.
+            var outputPort = outputPortToUse ?? GetOnlyOutputPortForSignalType(midpoint, signalType);
+
+            if (outputPort == null)
+            {
+                Debug.LogMessage(LogEventLevel.Debug, "Route terminates on midpoint {midpointKey} with no single output for {signalType}; switching input {inputPortKey} with no output selector", destination, destination.Key, signalType, goodInputPort.Key);
+            }
+
+            routeTable.Routes.Add(new RouteSwitchDescriptor(outputPort, goodInputPort));
         }
         else // device is merely IRoutingInputOutputs
             Debug.LogMessage(LogEventLevel.Verbose, "No routing. Passthrough device", destination);
 
         return true;
+    }
+
+    private static RoutingOutputPort GetOnlyOutputPortForSignalType(IRoutingOutputs device, eRoutingSignalType signalType)
+    {
+        var candidates = device.OutputPorts?.Where(p => p.Type.HasFlag(signalType)).Take(2).ToList();
+
+        return candidates?.Count == 1 ? candidates[0] : null;
     }
 }

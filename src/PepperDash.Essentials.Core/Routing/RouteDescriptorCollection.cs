@@ -107,6 +107,11 @@ public class RouteDescriptorCollection
     /// Returns the RouteDescriptor for a given destination AND removes it from collection.
     /// Returns null if no route with the provided destination exists.
     /// </summary>
+    /// <remarks>
+    /// Removes only the first match. An AudioVideo route is stored as two descriptors (one Audio,
+    /// one Video), so to release everything routed to a destination use
+    /// <see cref="RemoveRouteDescriptors"/> instead.
+    /// </remarks>
     /// <param name="destination">The destination device</param>
     /// <param name="inputPortKey">The input port key (optional)</param>
     /// <returns>The matching RouteDescriptor or null if not found</returns>
@@ -126,5 +131,81 @@ public class RouteDescriptorCollection
         Debug.LogMessage(LogEventLevel.Information, "Found route descriptor {routeDescriptor}", destination, descr);
 
         return descr;
+    }
+
+    /// <summary>
+    /// Removes and returns every RouteDescriptor for a destination, optionally limited to one input
+    /// port. An AudioVideo route is stored as separate Audio and Video descriptors, so "the route to
+    /// this destination" can be more than one; releasing only one of them orphans the other, along
+    /// with its output ports' in-use registrations.
+    /// </summary>
+    /// <param name="destination">The destination device</param>
+    /// <param name="inputPortKey">The input port key (optional). When empty, every descriptor for the destination is removed.</param>
+    /// <returns>The removed descriptors, oldest first. Empty if none matched.</returns>
+    public List<RouteDescriptor> RemoveRouteDescriptors(IRoutingInputs destination, string inputPortKey = "")
+    {
+        var removed = RouteDescriptors
+            .Where(rd => rd.Destination == destination &&
+                (string.IsNullOrEmpty(inputPortKey) || (rd.InputPort != null && rd.InputPort.Key == inputPortKey)))
+            .ToList();
+
+        foreach (var descriptor in removed)
+        {
+            RouteDescriptors.Remove(descriptor);
+        }
+
+        if (removed.Count > 0)
+        {
+            RouteDescriptorCollectionChanged?.Invoke(this, EventArgs.Empty);
+        }
+
+        Debug.LogMessage(LogEventLevel.Information, "Removed {count} route descriptor(s) for '{destination}':'{inputPortKey}'",
+            removed.Count, destination?.Key, string.IsNullOrEmpty(inputPortKey) ? "auto" : inputPortKey);
+
+        return removed;
+    }
+
+    /// <summary>
+    /// Records <paramref name="replacement"/> as the route for its destination, input port and signal
+    /// type, removing whatever was recorded there before - but only once there is something to put in
+    /// its place. Used to resync the collection with routing feedback without ever leaving a
+    /// destination with no descriptor, which would leave a later release nothing to tear down.
+    /// </summary>
+    /// <remarks>
+    /// When the existing descriptor already names the same source, nothing changes: that descriptor is
+    /// the one that was executed, and it holds the output ports' in-use registrations.
+    /// </remarks>
+    /// <param name="replacement">The descriptor to record. Null is ignored.</param>
+    /// <returns>True if the collection changed.</returns>
+    public bool ReplaceRouteDescriptor(RouteDescriptor replacement)
+    {
+        if (replacement == null)
+        {
+            return false;
+        }
+
+        var existing = RouteDescriptors
+            .Where(rd => rd.Destination == replacement.Destination &&
+                rd.SignalType == replacement.SignalType &&
+                rd.InputPort?.Key == replacement.InputPort?.Key)
+            .ToList();
+
+        if (existing.Count == 1 && existing[0].Source == replacement.Source)
+        {
+            return false;
+        }
+
+        foreach (var descriptor in existing)
+        {
+            RouteDescriptors.Remove(descriptor);
+        }
+
+        RouteDescriptors.Add(replacement);
+        RouteDescriptorCollectionChanged?.Invoke(this, EventArgs.Empty);
+
+        Debug.LogMessage(LogEventLevel.Debug, "Replaced {count} route descriptor(s) for '{destination}':'{inputPortKey}' ({signalType}) with route from {source}",
+            existing.Count, replacement.Destination?.Key, replacement.InputPort?.Key ?? "auto", replacement.SignalType, replacement.Source?.Key);
+
+        return true;
     }
 }

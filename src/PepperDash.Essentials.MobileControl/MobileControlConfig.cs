@@ -1,6 +1,7 @@
 ﻿using System.Collections.Generic;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Converters;
+using Newtonsoft.Json.Linq;
 
 namespace PepperDash.Essentials
 {
@@ -68,6 +69,40 @@ namespace PepperDash.Essentials
         /// </summary>
         [JsonProperty("automaticallyForwardPortToCSLAN")]
         public bool? AutomaticallyForwardPortToCSLAN { get; set; }
+
+        /// <summary>
+        /// Gets or sets the networks (CIDR notation) allowed to make HTTP requests to the direct server
+        /// </summary>
+        /// <remarks>
+        /// Example: ["192.168.10.0/24", "192.168.5.10/32"]. When the list has any entries, HTTP requests
+        /// (GET, POST, OPTIONS) from any other address have the connection closed without a response,
+        /// except loopback and clients on the Control Subnet, which are always allowed.
+        /// When null or empty, no filtering is done (default).
+        /// Invalid entries are logged and skipped, so a list containing only invalid entries still turns
+        /// filtering on. Does not apply to websocket connections, which are already gated by a per-client token.
+        /// </remarks>
+        [JsonProperty("allowedClientNetworks")]
+        public List<string> AllowedClientNetworks { get; set; }
+
+        /// <summary>
+        /// Gets or sets whether a request for a path the server does not handle gets no reply
+        /// </summary>
+        /// <remarks>
+        /// When true the connection is closed without a response. When false or absent (default) the server
+        /// replies 404, as it always has. Replying means writing to a connection the client may already have
+        /// reset, which throws from inside the HTTP stack, so noisy environments may prefer true.
+        /// </remarks>
+        [JsonProperty("dropUnrecognisedRequests")]
+        public bool? DropUnrecognisedRequests { get; set; }
+
+        /// <summary>
+        /// Gives each connected client its own transmit queue and send task, instead of sending to every
+        /// client from one shared transmit thread. A client that is slow to receive then only delays its
+        /// own messages, not every other client's. On by default; set <c>false</c> to send through the
+        /// shared transmit thread instead.
+        /// </summary>
+        [JsonProperty("perClientQueues")]
+        public bool PerClientQueues { get; set; } = true;
 
         /// <summary>
         /// Gets or sets the CSLanUiDeviceKeys
@@ -212,6 +247,22 @@ namespace PepperDash.Essentials
         /// </summary>
         [JsonProperty("partnerMetadata", NullValueHandling = NullValueHandling.Ignore)]
         public List<MobileControlPartnerMetadata> PartnerMetadata { get; set; }
+
+        /// <summary>
+        /// Gets or sets the lockout message overrides, keyed by touchpanel key
+        /// </summary>
+        [JsonProperty("lockoutMessagesByTouchpanel", NullValueHandling = NullValueHandling.Ignore)]
+        public Dictionary<string, MobileControlLockoutMessageOverride> LockoutMessagesByTouchpanel { get; set; }
+
+        /// <summary>
+        /// Any other properties in the <c>applicationConfig</c>, kept as-is. Essentials doesn't use
+        /// them; they're passed through into the <c>_config.local.json</c> / <c>_config.cs.json</c>
+        /// files the processor writes for the user app on every start, so app-specific settings
+        /// (e.g. a <c>datadog</c> block) can live in the Essentials config instead of being lost
+        /// when those files are regenerated.
+        /// </summary>
+        [JsonExtensionData]
+        public IDictionary<string, JToken> AdditionalProperties { get; set; }
     }
 
     /// <summary>
@@ -236,6 +287,24 @@ namespace PepperDash.Essentials
         /// </summary>
         [JsonProperty("logoPath")]
         public string LogoPath { get; set; }
+    }
+
+    /// <summary>
+    /// Represents a lockout message override for a single touchpanel key
+    /// </summary>
+    public class MobileControlLockoutMessageOverride
+    {
+        /// <summary>
+        /// Gets or sets the Title
+        /// </summary>
+        [JsonProperty("title", NullValueHandling = NullValueHandling.Ignore)]
+        public string Title { get; set; }
+
+        /// <summary>
+        /// Gets or sets the Message
+        /// </summary>
+        [JsonProperty("message", NullValueHandling = NullValueHandling.Ignore)]
+        public string Message { get; set; }
     }
 
     /// <summary>

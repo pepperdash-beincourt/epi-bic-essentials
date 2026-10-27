@@ -16,6 +16,7 @@ using System.IO;
 using WebSocketSharp;
 using WebSocketSharp.Server;
 using WebSocketSharp.Net;
+using PepperDash.Core.Web;
 
 namespace PepperDash.Core;
 
@@ -31,10 +32,8 @@ public class DebugWebsocketSink : ILogEventSink, IKeyed
     private HttpServer _httpsServer;
 
     private readonly string _path = "/debug/join/";
-    private const string _certificateName = "selfCres";
-    private const string _certificatePassword = "cres12345";
-    private static string CertPath =>
-        $"{Path.DirectorySeparatorChar}user{Path.DirectorySeparatorChar}{_certificateName}.pfx";
+    private const string _certificatePassword = PepperDash.Core.Web.ProcessorCertificate.Password;
+    private static string CertPath => PepperDash.Core.Web.ProcessorCertificate.FilePath;
 
     /// <summary>
     /// Gets the port number on which the HTTPS server is currently running.
@@ -52,29 +51,54 @@ public class DebugWebsocketSink : ILogEventSink, IKeyed
     /// <summary>
     /// Gets the WebSocket URL for the current server instance.
     /// </summary>
-    /// <remarks>The URL is dynamically constructed based on the server's current IP address, port,
-    /// and WebSocket path.</remarks>
+    /// <remarks>
+    /// The URL is dynamically constructed from the processor's LAN IP address, the port and the
+    /// WebSocket path. The control subnet address is only used when there is no usable LAN address,
+    /// since the debug app is normally reached over the LAN. Returns an empty string when the server
+    /// is not listening or no usable address can be read.
+    /// </remarks>
     public string Url
     {
         get
         {
-            if (_httpsServer == null || !_httpsServer.IsListening) return "";
-            var service = _httpsServer.WebSocketServices[_path];
-            if (service == null) return "";
+            var host = ProcessorEthernetInfo.GetLanIpAddress() ?? ProcessorEthernetInfo.GetCsLanIpAddress();
 
-            // Use CSLAN IP if available, otherwise fallback to primary IP. This ensures we provide a reachable URL in dual-stack environments.
-            // On hardware with no second (CS-LAN) Ethernet adapter, GetEthernetParameter for adapter 1
-            // does not return null/empty for GET_CURRENT_IP_ADDRESS - it returns the literal string
-            // "Invalid Value". That string is non-empty, so an IsNullOrEmpty check alone treats it as a
-            // usable address and bakes it straight into the URL, breaking every client trying to connect
-            // (observed: "wss://Invalid Value:<port>/debug/join/"). Validate it actually parses as an IP
-            // before using it, so hardware without a CS-LAN adapter correctly falls back to adapter 0.
-            var cslanIp = CrestronEthernetHelper.GetEthernetParameter(CrestronEthernetHelper.ETHERNET_PARAMETER_TO_GET.GET_CURRENT_IP_ADDRESS, 1);
-            if (System.Net.IPAddress.TryParse(cslanIp, out _))
-                return $"wss://{cslanIp}:{_httpsServer.Port}{service.Path}";
-            else
-                return $"wss://{CrestronEthernetHelper.GetEthernetParameter(CrestronEthernetHelper.ETHERNET_PARAMETER_TO_GET.GET_CURRENT_IP_ADDRESS, 0)}:{_httpsServer.Port}{service.Path}";
+            return GetUrlForHost(host);
         }
+    }
+
+    /// <summary>
+    /// Gets the WebSocket path clients connect to, e.g. <c>/debug/join</c>. Exposed so a client that
+    /// already knows the processor's address — a browser on a page the processor served, for instance —
+    /// can build the URL itself from its own location.
+    /// </summary>
+    public string ServicePath
+    {
+        get
+        {
+            var service = _httpsServer?.WebSocketServices[_path];
+
+            return service?.Path ?? _path.TrimEnd('/');
+        }
+    }
+
+    /// <summary>
+    /// Builds the WebSocket URL for this server using the supplied host, which lets callers hand back
+    /// the address the client actually used to reach the processor.
+    /// </summary>
+    /// <param name="host">Host name or IP address, without scheme or port. IPv6 literals must already be bracketed.</param>
+    /// <returns>The <c>wss://</c> URL, or an empty string when the server is not listening or <paramref name="host"/> is unusable.</returns>
+    public string GetUrlForHost(string host)
+    {
+        if (_httpsServer == null || !_httpsServer.IsListening) return "";
+
+        var service = _httpsServer.WebSocketServices[_path];
+        if (service == null) return "";
+
+        host = ProcessorEthernetInfo.NullIfInvalid(host);
+        if (host == null) return "";
+
+        return $"wss://{host}:{_httpsServer.Port}{service.Path}";
     }
 
     /// <summary>
@@ -98,6 +122,13 @@ public class DebugWebsocketSink : ILogEventSink, IKeyed
 
     /// <inheritdoc/>
     public string Key => "DebugWebsocketSink";
+
+    /// <summary>
+    /// Log messages for clients that poll over HTTP instead of connecting to the WebSocket, for example
+    /// on a Virtual Control server whose firewall blocks the WebSocket port. Collects only while a
+    /// client is polling.
+    /// </summary>
+    public PolledMessageBuffer PollBuffer { get; } = new PolledMessageBuffer(1000, TimeSpan.FromSeconds(60));
 
     private readonly ITextFormatter _textFormatter;
 
@@ -138,14 +169,29 @@ public class DebugWebsocketSink : ILogEventSink, IKeyed
         // CrestronConsole.PrintLine only, to avoid a NullReferenceException that would poison the Debug type.
         try
         {
-            var ipAddress = CrestronEthernetHelper.GetEthernetParameter(CrestronEthernetHelper.ETHERNET_PARAMETER_TO_GET.GET_CURRENT_IP_ADDRESS, 0);
-            var hostName = CrestronEthernetHelper.GetEthernetParameter(CrestronEthernetHelper.ETHERNET_PARAMETER_TO_GET.GET_HOSTNAME, 0);
-            var domainName = CrestronEthernetHelper.GetEthernetParameter(CrestronEthernetHelper.ETHERNET_PARAMETER_TO_GET.GET_DOMAIN_NAME, 0);
+            // GetEthernetParameter returns the literal string "Invalid Value" rather than throwing when a
+            // parameter cannot be read, so every value has to be validated before it goes into the cert.
+            var ipAddress = ProcessorEthernetInfo.GetLanIpAddress();
+            var csIpAddress = ProcessorEthernetInfo.GetCsLanIpAddress();
+            var hostName = ProcessorEthernetInfo.GetParameter(CrestronEthernetHelper.ETHERNET_PARAMETER_TO_GET.GET_HOSTNAME, 0);
+            var domainName = ProcessorEthernetInfo.GetParameter(CrestronEthernetHelper.ETHERNET_PARAMETER_TO_GET.GET_DOMAIN_NAME, 0);
 
-            CrestronConsole.PrintLine(string.Format("CreateCert: DomainName: {0} | HostName: {1} | {1}.{0}@{2}", domainName, hostName, ipAddress));
+            CrestronConsole.PrintLine(string.Format("CreateCert: DomainName: {0} | HostName: {1} | IP: {2} | CS IP: {3}",
+                domainName ?? "<none>", hostName ?? "<none>", ipAddress ?? "<none>", csIpAddress ?? "<none>"));
 
-            var subjectName = string.Format("CN={0}.{1}", hostName, domainName);
-            var fqdn = string.Format("{0}.{1}", hostName, domainName);
+            // Fall back to the IP address when there is no usable host name, so the subject is never
+            // built out of unreadable parameters.
+            var fqdn = hostName == null
+                ? ipAddress
+                : domainName == null ? hostName : string.Format("{0}.{1}", hostName, domainName);
+
+            if (string.IsNullOrEmpty(fqdn))
+            {
+                CrestronConsole.PrintLine("CreateCert: No usable host name or IP address; aborting certificate creation");
+                return;
+            }
+
+            var subjectName = string.Format("CN={0}", fqdn);
 
             using var rsa = RSA.Create(2048);
 
@@ -169,11 +215,15 @@ public class DebugWebsocketSink : ILogEventSink, IKeyed
                     },
                     false));
 
-            // Subject Alternative Names: DNS + IP
+            // Subject Alternative Names: DNS + every address the browser could reach the processor on
             var sanBuilder = new SubjectAlternativeNameBuilder();
             sanBuilder.AddDnsName(fqdn);
+            if (hostName != null && hostName != fqdn)
+                sanBuilder.AddDnsName(hostName);
             if (System.Net.IPAddress.TryParse(ipAddress, out var ip))
                 sanBuilder.AddIpAddress(ip);
+            if (System.Net.IPAddress.TryParse(csIpAddress, out var csIp))
+                sanBuilder.AddIpAddress(csIp);
             request.CertificateExtensions.Add(sanBuilder.Build());
 
             var notBefore = DateTimeOffset.UtcNow;
@@ -181,8 +231,7 @@ public class DebugWebsocketSink : ILogEventSink, IKeyed
 
             using var cert = request.CreateSelfSigned(notBefore, notAfter);
 
-            var separator = Path.DirectorySeparatorChar;
-            var outputPath = string.Format("{0}user{1}{2}.pfx", separator, separator, _certificateName);
+            var outputPath = CertPath;
 
             var pfxBytes = cert.Export(X509ContentType.Pfx, _certificatePassword);
             File.WriteAllBytes(outputPath, pfxBytes);
@@ -204,12 +253,22 @@ public class DebugWebsocketSink : ILogEventSink, IKeyed
     /// <param name="logEvent">The log event to be formatted and broadcasted. Cannot be null.</param>
     public void Emit(LogEvent logEvent)
     {
-        if (_httpsServer == null || !_httpsServer.IsListening) return;
+        // StopServer can null the field from another thread, so work from one reference
+        var server = _httpsServer;
+        var listening = server != null && server.IsListening;
+        var polling = PollBuffer.IsActive;
+
+        if (!listening && !polling) return;
 
         var sw = new StringWriter();
         _textFormatter.Format(logEvent, sw);
+        var message = sw.ToString();
 
-        _httpsServer.WebSocketServices[_path].Sessions.Broadcast(sw.ToString());
+        if (polling)
+            PollBuffer.Add(message);
+
+        if (listening)
+            server.WebSocketServices[_path]?.Sessions.Broadcast(message);
     }
 
     /// <summary>

@@ -26,10 +26,34 @@ namespace PepperDash.Essentials.Touchpanel
     /// Mobile Control touchpanel controller that provides app control, Zoom integration, 
     /// and mobile control functionality for Crestron touchpanels.
     /// </summary>
-    public class MobileControlTouchpanelController : TouchpanelBase, IHasFeedback, ITswAppControl, ITswZoomControl, IDeviceInfoProvider, IMobileControlCrestronTouchpanelController, ITheme
+    public class MobileControlTouchpanelController : TouchpanelBase, IHasFeedback, ITswAppControl, ITswZoomControl, IDeviceInfoProvider, IMobileControlCrestronTouchpanelController, ITheme, ICommunicationMonitor
     {
         private readonly MobileControlTouchpanelProperties localConfig;
         private IMobileControlRoomMessenger _bridge;
+
+        /// <summary>
+        /// Gets the CommunicationMonitor tracking the panel's online/offline state, so the panel
+        /// shows up on the Health page like any other monitored device.
+        /// </summary>
+        public StatusMonitorBase CommunicationMonitor { get; private set; }
+
+        /// <summary>
+        /// Stands in for the real monitor when no panel object was supplied, so consumers of
+        /// <see cref="ICommunicationMonitor"/> never see a null monitor.
+        /// </summary>
+        private sealed class NullCommunicationMonitor : StatusMonitorBase
+        {
+            public NullCommunicationMonitor(IKeyed parent) : base(parent, 120000, 300000)
+            {
+                Status = MonitorStatus.InError;
+                Message = "Panel is not initialized";
+            }
+
+            public override void Start() { }
+            public override void Stop() { }
+        }
+
+        private const string CacheBusterParamName = "cb";
 
         private string _appUrl;
 
@@ -147,6 +171,10 @@ namespace PepperDash.Essentials.Touchpanel
         public MobileControlTouchpanelController(string key, string name, BasicTriListWithSmartObject panel, MobileControlTouchpanelProperties config) : base(key, name, panel, config)
         {
             localConfig = config;
+
+            CommunicationMonitor = panel != null
+                ? new CrestronGenericBaseCommunicationMonitor(this, panel, 120000, 300000)
+                : new NullCommunicationMonitor(this);
 
             AddPostActivationAction(SubscribeForMobileControlUpdates);
 
@@ -388,6 +416,8 @@ namespace PepperDash.Essentials.Touchpanel
         /// </summary>
         protected override bool CustomActivate()
         {
+            CommunicationMonitor.Start();
+
             var appMessenger = new ITswAppControlMessenger($"appControlMessenger-{Key}", $"/device/{Key}", this);
 
             var zoomMessenger = new ITswZoomControlMessenger($"zoomControlMessenger-{Key}", $"/device/{Key}", this);
@@ -445,6 +475,17 @@ namespace PepperDash.Essentials.Touchpanel
             Panel.OnlineStatusChange += Panel_OnlineChange;
         }
 
+        /// <summary>
+        /// Stops the CommunicationMonitor on deactivation.
+        /// </summary>
+        /// <returns>True if deactivation was successful; otherwise, false.</returns>
+        public override bool Deactivate()
+        {
+            CommunicationMonitor.Stop();
+
+            return base.Deactivate();
+        }
+
         private void Panel_OnlineChange(GenericBase sender, OnlineOfflineEventArgs args)
         {
             try
@@ -487,19 +528,17 @@ namespace PepperDash.Essentials.Touchpanel
 
         private void SendUrlToPanel()
         {
-            var appUrl = GetUrlWithCorrectIp(_appUrl);
+            // Mint a fresh cache buster on every send. Some panels hold on to a cached copy of the app
+            // and won't re-download it unless the URL they're handed is different from the last one.
+            var appUrl = GetUrlWithCacheBuster(ResolveAppUrlHost(_appUrl));
 
-            this.LogInformation("Sending {appUrl} on join 1", AppUrlFeedback.StringValue);
+            this.LogInformation("Sending {appUrl} on join 1", appUrl);
 
-            if (Panel.StringInput[1].StringValue == appUrl)
-            {
-                this.LogInformation("App URL already set to {appUrl}, no update needed", AppUrlFeedback.StringValue);
-                return;
-            }
+            _appUrl = appUrl;
 
             Panel.StringInput[1].StringValue = appUrl;
 
-            SetAppUrl(appUrl);
+            AppUrlFeedback.FireUpdate();
         }
 
         private void Panel_IpInformationChange(GenericBase sender, ConnectedIpEventArgs args)
@@ -545,14 +584,45 @@ namespace PepperDash.Essentials.Touchpanel
                 return false;
             }) ? csIpAddress.ToString() : processorIp;
 
-            // Swap the host, keep the rest of the URL - including its scheme. Matching only http
-            // left a panel on the Control Subnet pointed at the processor's LAN address whenever the
-            // direct server was running secure, which under isolation mode it cannot reach at all.
-            var updatedUrl = Regex.Replace(url, @"^(https?://)[^:/]+", "${1}" + ip);
+            var match = Regex.Match(url, @"^(https?)://([^:/]+):\d+/mc/app\?token=.+$");
+            if (match.Success)
+            {
+                string ipa = match.Groups[2].Value;
+                // ip will be "192.168.1.100"
+            }
+
+            // replace the host but preserve whatever scheme (http/https) is already present in the URL
+            var updatedUrl = Regex.Replace(url, @"^(https?)://[^:/]+", $"$1://{ip}");
 
             this.LogVerbose("Updated URL: {updatedUrl}", updatedUrl);
 
             return updatedUrl;
+        }
+
+        /// <summary>
+        /// Appends a unique cache busting query parameter to the URL so the panel's browser treats it as
+        /// a new address and re-downloads the app instead of serving whatever it has cached.
+        /// </summary>
+        /// <param name="url">The URL to add the cache buster to</param>
+        /// <returns>The URL with a freshly generated cache busting parameter</returns>
+        private string GetUrlWithCacheBuster(string url)
+        {
+            if (string.IsNullOrEmpty(url))
+            {
+                return url;
+            }
+
+            // drop any cache buster left over from a previous send so they don't accumulate.
+            // the leading '?' or '&' is kept so the rest of the query string stays intact
+            var cleanUrl = Regex.Replace(url, $@"([?&]){CacheBusterParamName}=[^&]*&?", "$1").TrimEnd('?', '&');
+
+            var separator = cleanUrl.Contains("?") ? "&" : "?";
+
+            var bustedUrl = $"{cleanUrl}{separator}{CacheBusterParamName}={Guid.NewGuid():N}";
+
+            this.LogVerbose("URL with cache buster: {bustedUrl}", bustedUrl);
+
+            return bustedUrl;
         }
 
         private void SubscribeForMobileControlUpdates()
@@ -657,19 +727,31 @@ namespace PepperDash.Essentials.Touchpanel
                 return;
             }
 
-            if(localConfig.DevelopmentServerAddress != null)
-            {
-                url = Regex.Replace(url, @"^http://[^/]+", $"http://{localConfig.DevelopmentServerAddress}");
-                this.LogInformation("Using development server IP, updated URL: {url}", url);
-            }
-            else
-            {
-                url = GetUrlWithCorrectIp(url);
-            }
-
-            _appUrl = url;
+            _appUrl = GetUrlWithCacheBuster(ResolveAppUrlHost(url));
 
             AppUrlFeedback.FireUpdate();
+        }
+
+        /// <summary>
+        /// Points the URL at the configured development server if there is one, otherwise at the
+        /// processor IP the panel can reach.
+        /// </summary>
+        private string ResolveAppUrlHost(string url)
+        {
+            if (localConfig.DevelopmentServerAddress == null)
+            {
+                return GetUrlWithCorrectIp(url);
+            }
+
+            var devServerAddress = localConfig.DevelopmentServerAddress.TrimEnd('/');
+            url = Regex.Replace(url, @"^(https?)://[^/]+", $"$1://{devServerAddress}");
+            // Dev servers (e.g. Vite with base "/mc/app/") only match the app path with its
+            // trailing slash; the processor's own server accepts "/mc/app?token=..." without it.
+            url = Regex.Replace(url, @"/mc/app(?=\?|$)", "/mc/app/");
+
+            this.LogInformation("Using development server address, updated URL: {url}", url);
+
+            return url;
         }
 
         private void UpdateFeedbacks(object sender, EventArgs args)
@@ -824,7 +906,7 @@ namespace PepperDash.Essentials.Touchpanel
         /// </summary>
         public MobileControlTouchpanelControllerFactory()
         {
-            TypeNames = new List<string>() { "mccrestronapp", "mctsw550", "mctsw750", "mctsw1050", "mctsw560", "mctsw760", "mctsw1060", "mctsw570", "mctsw770", "mcts770", "mctsw1070", "mcts1070", "mcxpanel", "mcdge1000" };
+            TypeNames = new List<string>() { "mccrestronapp", "mctsw550", "mctsw750", "mctsw1050", "mctsw560", "mctsw760", "mctsw1060", "mctsw570", "mctsw770", "mcts770", "mctsw1070", "mcts1070", "mctsw1080", "mcts1080", "mcxpanel", "mcdge1000" };
             MinimumEssentialsFrameworkVersion = "2.0.0";
 
             factories = new Dictionary<string, Func<uint, CrestronControlSystem, string, BasicTriListWithSmartObject>>
@@ -849,6 +931,8 @@ namespace PepperDash.Essentials.Touchpanel
                 {"ts770", (id, controlSystem, projectName) => new Ts770(id, controlSystem)},
                 {"tsw1070", (id, controlSystem, projectName) => new Tsw1070(id, controlSystem)},
                 {"ts1070", (id, controlSystem, projectName) => new Ts1070(id, controlSystem)},
+                {"tsw1080", (id, controlSystem, projectName) => new Tsw1080(id, controlSystem)},
+                {"ts1080", (id, controlSystem, projectName) => new Ts1080(id, controlSystem)},
                 {"dge1000", (id, controlSystem, projectName) => new Dge1000(id, controlSystem)}
             };
         }

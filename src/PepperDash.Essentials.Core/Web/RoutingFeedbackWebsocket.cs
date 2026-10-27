@@ -9,6 +9,8 @@ using Crestron.SimplSharp;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Serialization;
 using PepperDash.Core;
+using PepperDash.Core.Web;
+using PepperDash.Essentials.Core.Routing;
 using Serilog.Events;
 using WebSocketSharp;
 using WebSocketSharp.Server;
@@ -24,12 +26,10 @@ public class RoutingFeedbackWebsocket : IKeyed
 {
     private HttpServer _httpsServer;
     private readonly string _path = "/routing/join/";
-    private const string _certificateName = "selfCres";
-    private const string _certificatePassword = "cres12345";
+    private const string _certificatePassword = PepperDash.Core.Web.ProcessorCertificate.Password;
     private const long DEBOUNCE_MS = 200;
 
-    private static string CertPath =>
-        $"{Path.DirectorySeparatorChar}user{Path.DirectorySeparatorChar}{_certificateName}.pfx";
+    private static string CertPath => PepperDash.Core.Web.ProcessorCertificate.FilePath;
 
     private readonly Dictionary<string, Timer> _debounceTimers = new Dictionary<string, Timer>();
 
@@ -38,14 +38,81 @@ public class RoutingFeedbackWebsocket : IKeyed
     // own separate nodes - see RoutingGraphHelpers. Rebuilt whenever the server (re)starts.
     private Dictionary<string, RoutingGraphHelpers.TileChildInfo> _tileChildren = new Dictionary<string, RoutingGraphHelpers.TileChildInfo>();
 
+    // The input port last reported to clients for each sink, keyed by the sink's own device key. A
+    // sink whose route is cleared can report a null CurrentInputPort, and one that switches inputs
+    // only reports the new port, so this is what lets us tell clients which port to clear.
+    private readonly Dictionary<string, RoutingInputPort> _reportedSinkPorts = new Dictionary<string, RoutingInputPort>();
+
     private static readonly JsonSerializerSettings JsonSettings = new JsonSerializerSettings
     {
         ContractResolver = new CamelCasePropertyNamesContractResolver(),
         NullValueHandling = NullValueHandling.Ignore
     };
 
+    // Whether the routing event handlers are attached. They stay attached while the WebSocket server
+    // runs or a client is polling.
+    private bool _subscribed;
+    private readonly object _subscriptionLock = new object();
+    private Timer _pollIdleTimer;
+
     /// <inheritdoc/>
     public string Key => "RoutingFeedbackWebsocket";
+
+    /// <summary>
+    /// Routing messages for clients that poll over HTTP instead of connecting to the WebSocket, for
+    /// example on a Virtual Control server whose firewall blocks the WebSocket port. Collects only while
+    /// a client is polling.
+    /// </summary>
+    public PolledMessageBuffer PollBuffer { get; } = new PolledMessageBuffer(500, TimeSpan.FromSeconds(60));
+
+    /// <summary>
+    /// Starts collecting routing messages for a polling client and returns the snapshot to start from.
+    /// </summary>
+    /// <param name="cursor">The ID to pass as <c>since</c> on the first poll.</param>
+    /// <returns>The full routing state, in the same form the WebSocket sends on connect.</returns>
+    public string StartPolling(out long cursor)
+    {
+        EnsureSubscribed();
+
+        // Take the cursor before building the snapshot, so a change made in between is delivered again
+        // rather than lost. Every routing message carries absolute state, so a repeat is harmless.
+        cursor = PollBuffer.Activate();
+
+        lock (_subscriptionLock)
+        {
+            if (_pollIdleTimer == null)
+            {
+                _pollIdleTimer = new Timer(PollBuffer.IdleTimeout.TotalMilliseconds / 2) { AutoReset = true };
+                _pollIdleTimer.Elapsed += (s, e) => StopWhenIdle();
+                _pollIdleTimer.Start();
+            }
+        }
+
+        return GetSnapshotMessage();
+    }
+
+    /// <summary>
+    /// Stops collecting routing messages for polling clients.
+    /// </summary>
+    public void StopPolling()
+    {
+        PollBuffer.Deactivate();
+        StopWhenIdle();
+    }
+
+    private void StopWhenIdle()
+    {
+        lock (_subscriptionLock)
+        {
+            if (PollBuffer.IsActive) return;
+
+            _pollIdleTimer?.Stop();
+            _pollIdleTimer?.Dispose();
+            _pollIdleTimer = null;
+
+            if (!IsRunning) UnsubscribeFromRoutingEvents();
+        }
+    }
 
     /// <summary>
     /// Gets the port number on which the server is currently running.
@@ -59,18 +126,44 @@ public class RoutingFeedbackWebsocket : IKeyed
     {
         get
         {
-            if (_httpsServer == null || !_httpsServer.IsListening) return "";
-            var service = _httpsServer.WebSocketServices[_path];
-            if (service == null) return "";
+            var host = ProcessorEthernetInfo.GetLanIpAddress() ?? ProcessorEthernetInfo.GetCsLanIpAddress();
 
-            var ip = CrestronEthernetHelper.GetEthernetParameter(
-                CrestronEthernetHelper.ETHERNET_PARAMETER_TO_GET.GET_CURRENT_IP_ADDRESS, 0);
-            if (string.IsNullOrEmpty(ip) || ip == "Invalid Value")
-                ip = CrestronEthernetHelper.GetEthernetParameter(
-                    CrestronEthernetHelper.ETHERNET_PARAMETER_TO_GET.GET_CURRENT_IP_ADDRESS, 1);
-
-            return $"wss://{ip}:{_httpsServer.Port}{service.Path}";
+            return GetUrlForHost(host);
         }
+    }
+
+    /// <summary>
+    /// Gets the WebSocket path clients connect to, e.g. <c>/routing/join</c>. Exposed so a client that
+    /// already knows the processor's address — a browser on a page the processor served, for instance —
+    /// can build the URL itself from its own location.
+    /// </summary>
+    public string ServicePath
+    {
+        get
+        {
+            var service = _httpsServer?.WebSocketServices[_path];
+
+            return service?.Path ?? _path.TrimEnd('/');
+        }
+    }
+
+    /// <summary>
+    /// Builds the WebSocket URL for this server using the supplied host, which lets callers hand back
+    /// the address the client actually used to reach the processor.
+    /// </summary>
+    /// <param name="host">Host name or IP address, without scheme or port. IPv6 literals must already be bracketed.</param>
+    /// <returns>The <c>wss://</c> URL, or an empty string when the server is not listening or <paramref name="host"/> is unusable.</returns>
+    public string GetUrlForHost(string host)
+    {
+        if (_httpsServer == null || !_httpsServer.IsListening) return "";
+
+        var service = _httpsServer.WebSocketServices[_path];
+        if (service == null) return "";
+
+        host = ProcessorEthernetInfo.NullIfInvalid(host);
+        if (host == null) return "";
+
+        return $"wss://{host}:{_httpsServer.Port}{service.Path}";
     }
 
     /// <summary>
@@ -123,7 +216,7 @@ public class RoutingFeedbackWebsocket : IKeyed
             _httpsServer.Start();
 
             RoutingFeedbackClient.Owner = this;
-            SubscribeToRoutingEvents();
+            EnsureSubscribed();
 
             Debug.LogMessage(LogEventLevel.Information, "Routing Feedback WebSocket ready at {url}", this, Url);
         }
@@ -139,8 +232,6 @@ public class RoutingFeedbackWebsocket : IKeyed
     /// </summary>
     public void StopServer()
     {
-        UnsubscribeFromRoutingEvents();
-
         try
         {
             if (_httpsServer == null || !_httpsServer.IsListening)
@@ -153,6 +244,14 @@ public class RoutingFeedbackWebsocket : IKeyed
         catch (Exception ex)
         {
             Debug.LogError(ex, "Routing Feedback WebSocket failed to stop: {message}", this, ex.Message);
+        }
+        finally
+        {
+            // Polling clients still need the events
+            lock (_subscriptionLock)
+            {
+                if (!PollBuffer.IsActive) UnsubscribeFromRoutingEvents();
+            }
         }
     }
 
@@ -177,7 +276,7 @@ public class RoutingFeedbackWebsocket : IKeyed
                 {
                     InputPortKey = r.InputPort.Key,
                     OutputPortKey = r.OutputPort?.Key,
-                    SignalType = r.InputPort.Type.ToString()
+                    SignalType = (r.SignalType ?? r.InputPort.Type).ToString()
                 })
                 .ToList();
         }
@@ -231,8 +330,19 @@ public class RoutingFeedbackWebsocket : IKeyed
         return JsonConvert.SerializeObject(snapshot, JsonSettings);
     }
 
+    private void EnsureSubscribed()
+    {
+        lock (_subscriptionLock)
+        {
+            if (_subscribed) return;
+
+            SubscribeToRoutingEvents();
+        }
+    }
+
     private void SubscribeToRoutingEvents()
     {
+        _subscribed = true;
         _tileChildren = RoutingGraphHelpers.BuildTileChildMap();
 
         var midpointDevices = DeviceManager.AllDevices.OfType<IRoutingMidpointWithFeedback>();
@@ -242,9 +352,21 @@ public class RoutingFeedbackWebsocket : IKeyed
         }
 
         var sinkDevices = DeviceManager.AllDevices.OfType<IRoutingSinkWithFeedback>();
+        lock (_reportedSinkPorts)
+        {
+            // Seed from current state, which is what the connect snapshot reports
+            _reportedSinkPorts.Clear();
+            foreach (var device in sinkDevices)
+            {
+                if (device.CurrentInputPort != null)
+                    _reportedSinkPorts[device.Key] = device.CurrentInputPort;
+            }
+        }
+
         foreach (var device in sinkDevices)
         {
             device.InputChanged += HandleSinkInputChanged;
+            device.CurrentSourcesChanged += HandleSinkCurrentSourcesChanged;
         }
 
         var layoutDevices = DeviceManager.AllDevices.OfType<IRoutingSinkWithLayoutState>();
@@ -256,6 +378,8 @@ public class RoutingFeedbackWebsocket : IKeyed
 
     private void UnsubscribeFromRoutingEvents()
     {
+        _subscribed = false;
+
         var midpointDevices = DeviceManager.AllDevices.OfType<IRoutingMidpointWithFeedback>();
         foreach (var device in midpointDevices)
         {
@@ -266,6 +390,7 @@ public class RoutingFeedbackWebsocket : IKeyed
         foreach (var device in sinkDevices)
         {
             device.InputChanged -= HandleSinkInputChanged;
+            device.CurrentSourcesChanged -= HandleSinkCurrentSourcesChanged;
         }
 
         var layoutDevices = DeviceManager.AllDevices.OfType<IRoutingSinkWithLayoutState>();
@@ -285,7 +410,7 @@ public class RoutingFeedbackWebsocket : IKeyed
                 {
                     InputPortKey = r.InputPort.Key,
                     OutputPortKey = r.OutputPort?.Key,
-                    SignalType = r.InputPort.Type.ToString()
+                    SignalType = (r.SignalType ?? r.InputPort.Type).ToString()
                 })
                 .ToList() ?? new List<MidpointRouteDto>();
 
@@ -320,19 +445,31 @@ public class RoutingFeedbackWebsocket : IKeyed
 
     private void HandleSinkInputChanged(IRoutingSinkWithFeedback sender, RoutingInputPort currentInputPort)
     {
-        // Tile-sink children are reported under their IRoutingSinkWithLayouts parent's key, with a
-        // qualified port key, so clients see this as an input change on the parent's node rather than
-        // on a device that isn't otherwise represented in the graph.
-        var deviceKey = sender.Key;
-        var inputPortKey = currentInputPort?.Key ?? "";
+        EmitSinkInputChanged(sender, currentInputPort);
+    }
 
-        if (_tileChildren.TryGetValue(deviceKey, out var tileInfo))
-        {
-            deviceKey = tileInfo.Parent.Key;
-            if (!string.IsNullOrEmpty(inputPortKey))
-                inputPortKey = RoutingGraphHelpers.QualifyTilePortKey(tileInfo.TileNumber, inputPortKey);
-        }
+    /// <summary>
+    /// Mirrors a sink's current-source bookkeeping out to clients.
+    /// </summary>
+    /// <remarks>
+    /// Clearing a route calls <c>SetCurrentSource(..., null)</c> but never <c>ExecuteSwitch</c> on the
+    /// destination itself (<c>RouteDescriptor.ReleaseRoutes</c> only tears down midpoints), so
+    /// <c>InputChanged</c> never fires and a cleared sink's edge would stay drawn until the client
+    /// reloaded. Subscribing here also gives live feedback for routes made through device-specific
+    /// bulk APIs, which set the current source without switching an input port.
+    ///
+    /// Both this and <c>InputChanged</c> share the per-sink debounce key, so a normal route that
+    /// raises both events still broadcasts once, and the broadcast reads the sink's state at fire
+    /// time rather than whatever it was when the first event arrived.
+    /// </remarks>
+    private void HandleSinkCurrentSourcesChanged(object sender, CurrentSourcesChangedEventArgs e)
+    {
+        if (sender is IRoutingSinkWithFeedback sink)
+            EmitSinkInputChanged(sink, sink.CurrentInputPort);
+    }
 
+    private void EmitSinkInputChanged(IRoutingSinkWithFeedback sender, RoutingInputPort currentInputPort)
+    {
         DebounceBroadcast($"sink-{sender.Key}", () =>
         {
             // Read the source directly from the sink's own current-source bookkeeping (see
@@ -340,17 +477,51 @@ public class RoutingFeedbackWebsocket : IKeyed
             // device-specific bulk API (e.g. ApplyDynamicLayout) never creates a tie line at all.
             var sourceDeviceKey = currentInputPort != null ? (RoutingGraphHelpers.GetCurrentSourceKey(sender) ?? "") : "";
 
-            var msg = new SinkInputChangedDto
+            RoutingInputPort previousPort;
+            lock (_reportedSinkPorts)
             {
-                Type = "sinkInputChanged",
-                DeviceKey = deviceKey,
-                InputPortKey = inputPortKey,
-                SourceDeviceKey = sourceDeviceKey,
-                SignalType = currentInputPort?.Type.ToString() ?? ""
-            };
+                _reportedSinkPorts.TryGetValue(sender.Key, out previousPort);
+                if (currentInputPort != null)
+                    _reportedSinkPorts[sender.Key] = currentInputPort;
+                else
+                    _reportedSinkPorts.Remove(sender.Key);
+            }
 
-            Broadcast(JsonConvert.SerializeObject(msg, JsonSettings));
+            // Clear the port the client last saw when the sink has moved off it - either to another
+            // input or, when a route is cleared, to no input at all. Both messages go out from this one
+            // debounced action, since a second DebounceBroadcast on the same key would cancel the first.
+            if (previousPort != null && previousPort.Key != currentInputPort?.Key)
+                BroadcastSinkInputChanged(sender, previousPort, "");
+
+            if (currentInputPort != null)
+                BroadcastSinkInputChanged(sender, currentInputPort, sourceDeviceKey);
         });
+    }
+
+    private void BroadcastSinkInputChanged(IRoutingSinkWithFeedback sender, RoutingInputPort port, string sourceDeviceKey)
+    {
+        // Tile-sink children are reported under their IRoutingSinkWithLayouts parent's key, with a
+        // qualified port key, so clients see this as an input change on the parent's node rather than
+        // on a device that isn't otherwise represented in the graph.
+        var deviceKey = sender.Key;
+        var inputPortKey = port.Key;
+
+        if (_tileChildren.TryGetValue(deviceKey, out var tileInfo))
+        {
+            deviceKey = tileInfo.Parent.Key;
+            inputPortKey = RoutingGraphHelpers.QualifyTilePortKey(tileInfo.TileNumber, inputPortKey);
+        }
+
+        var msg = new SinkInputChangedDto
+        {
+            Type = "sinkInputChanged",
+            DeviceKey = deviceKey,
+            InputPortKey = inputPortKey,
+            SourceDeviceKey = sourceDeviceKey,
+            SignalType = port.Type.ToString()
+        };
+
+        Broadcast(JsonConvert.SerializeObject(msg, JsonSettings));
     }
 
     private void DebounceBroadcast(string key, Action action)
@@ -393,9 +564,12 @@ public class RoutingFeedbackWebsocket : IKeyed
 
     private void Broadcast(string message)
     {
-        if (_httpsServer == null || !_httpsServer.IsListening) return;
+        PollBuffer.Add(message);
 
-        var service = _httpsServer.WebSocketServices[_path];
+        var server = _httpsServer;
+        if (server == null || !server.IsListening) return;
+
+        var service = server.WebSocketServices[_path];
         if (service == null) return;
 
         service.Sessions.Broadcast(message);

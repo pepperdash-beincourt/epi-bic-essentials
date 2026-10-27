@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Threading.Tasks;
 using Newtonsoft.Json;
 using PepperDash.Core;
 using PepperDash.Core.Logging;
@@ -58,7 +57,9 @@ namespace PepperDash.Essentials.AppServer.Messengers
                     Presets = GetCurrentPresets()
                 };
 
-                Task.Run(() => PostStatusMessage(state, id));
+                // Sent on the calling thread (handlers already run on a pool thread), so a batch status
+                // request can include it in its aggregated reply.
+                PostStatusMessage(state, id);
             }
             catch (Exception ex)
             {
@@ -66,10 +67,15 @@ namespace PepperDash.Essentials.AppServer.Messengers
             }
         }
 
+        /// <remarks>
+        /// A codec that hasn't connected yet may not have created its far-end feedback or preset lists
+        /// (the Cisco plugin builds them after its first sync), so any of them can be null. The status
+        /// is then sent without presets rather than failing.
+        /// </remarks>
         private List<CodecRoomPreset> GetCurrentPresets()
         {
             if (_device is IHasFarEndCameraControl farEndControl &&
-                farEndControl.ControllingFarEndCameraFeedback.BoolValue)
+                farEndControl.ControllingFarEndCameraFeedback?.BoolValue == true)
                 return _presets.FarEndRoomPresets;
 
             return _presets.NearEndPresets;
