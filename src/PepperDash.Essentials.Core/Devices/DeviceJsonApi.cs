@@ -47,6 +47,16 @@ public class DeviceJsonApi
 
 
     /// <summary>
+    /// Executes a method on a device, passing string and byte[] parameters through unchanged.
+    /// </summary>
+    /// <remarks>
+    /// Kept so plugins compiled against the earlier one-parameter signature still bind at run time;
+    /// without it they fail with a MissingMethodException until they are rebuilt.
+    /// </remarks>
+    /// <param name="action"></param>
+    public static void DoDeviceAction(DeviceActionWrapper action) => DoDeviceAction(action, false);
+
+    /// <summary>
     /// Executes a method on a device based on a JSON-formatted command string, awaiting the result if the method is asynchronous.
     /// </summary>
     /// <param name="action"></param>
