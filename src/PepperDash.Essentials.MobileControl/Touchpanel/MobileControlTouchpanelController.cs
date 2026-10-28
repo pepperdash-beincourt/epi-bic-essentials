@@ -149,7 +149,14 @@ namespace PepperDash.Essentials.Touchpanel
         /// <summary>
         /// Gets device information including MAC address and IP address.
         /// </summary>
-        public DeviceInfo DeviceInfo => new DeviceInfo();
+        /// <remarks>
+        /// One instance, held for the life of the panel. This was an expression-bodied property
+        /// handing back a new DeviceInfo on every read, so each assignment below landed in a
+        /// throwaway and every reader got an empty object: the panel collected its MAC and IP from
+        /// the extender and then reported both as blank, including to anything gathering device
+        /// identity for the estate.
+        /// </remarks>
+        public DeviceInfo DeviceInfo { get; } = new DeviceInfo();
 
         /// <summary>
         /// Gets the list of connected IPs for this IpId
