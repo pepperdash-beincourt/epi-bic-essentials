@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Linq;
 using Crestron.SimplSharpPro;
 using Crestron.SimplSharpPro.DeviceSupport;
@@ -15,6 +16,12 @@ namespace PepperDash.Essentials.Core;
         /// Gets or sets the Hardware
         /// </summary>
 	    protected GenericBase Hardware;
+
+        /// <summary>
+        /// Feedback keys whose value function has already thrown, so a feedback that fails on every
+        /// event is reported once rather than on every event.
+        /// </summary>
+        private readonly HashSet<string> _faultedFeedbacks = new HashSet<string>();
 
     /// <summary>
     /// Returns a list containing the Outputs that we want to expose.
@@ -119,13 +126,14 @@ namespace PepperDash.Essentials.Core;
                 });
         }
 
-        foreach (var f in Feedbacks)
-        {
-            f.FireUpdate();
-        }
+        FireFeedbacks("activation");
 
+        // The monitor subscribes first on purpose. Handlers on a multicast event run in subscription
+        // order and one that throws stops the rest, so a monitor subscribed behind the feedback pass
+        // would never hear that the device came online - it would sit in error while the hardware was
+        // up. FireFeedbacks already contains that failure; this makes the ordering irrelevant too.
+        CommunicationMonitor.Start();
         Hardware.OnlineStatusChange += Hardware_OnlineStatusChange;
-        CommunicationMonitor.Start();    
 
 			return base.CustomActivate();
 		}
@@ -172,11 +180,46 @@ namespace PepperDash.Essentials.Core;
             return;  // protects in cases where device has been unregistered and feedbacks would attempt to access null sigs.
         }
 
-        foreach (var feedback in Feedbacks)
+        FireFeedbacks("online status change");
+		}
+
+        /// <summary>
+        /// Updates every feedback, keeping one failure from stopping the others.
+        /// </summary>
+        /// <remarks>
+        /// A feedback's value function reads the hardware, and a sig a model does not implement is not
+        /// null - it is a placeholder that throws when read. That exception used to escape the event
+        /// handler, which stopped the remaining feedbacks and every handler subscribed after this one.
+        /// </remarks>
+        /// <param name="context">What triggered the update, for the log.</param>
+        private void FireFeedbacks(string context)
         {
-            if (feedback != null)
-                feedback.FireUpdate();
-        }         
+            foreach (var feedback in Feedbacks)
+            {
+                if (feedback == null)
+                    continue;
+
+                try
+                {
+                    feedback.FireUpdate();
+                }
+                catch (Exception ex)
+                {
+                    var key = feedback.Key ?? "(unkeyed)";
+                    if (_faultedFeedbacks.Add(key))
+                    {
+                        Debug.LogMessage(LogEventLevel.Warning, this,
+                            "Feedback '{feedbackKey}' could not be read on {context} and was skipped: {message}. Further failures of this feedback are logged at verbose.",
+                            key, context, ex.Message);
+                    }
+                    else
+                    {
+                        Debug.LogMessage(LogEventLevel.Verbose, this,
+                            "Feedback '{feedbackKey}' could not be read on {context}: {message}",
+                            key, context, ex.Message);
+                    }
+                }
+            }
 		}
 
 		#region IStatusMonitor Members
