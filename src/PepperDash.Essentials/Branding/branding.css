@@ -29,6 +29,14 @@
   background-color: var(--bs-tertiary-bg) !important;
 }
 
+/* Text fields and dropdowns are built with a fixed white background (focused too), while their text
+   follows the theme, so typed text was near-white on white. Back to the theme's own field colour;
+   disabled fields keep the app's grey. */
+:root[data-bs-theme="dark"] .form-control:not(:disabled),
+:root[data-bs-theme="dark"] .form-select:not(:disabled) {
+  background-color: var(--bs-body-bg);
+}
+
 /* The routing diagram keeps its own light palette variables */
 :root[data-bs-theme="dark"] .react-flow {
   --xy-background-color-default: var(--bs-body-bg);
