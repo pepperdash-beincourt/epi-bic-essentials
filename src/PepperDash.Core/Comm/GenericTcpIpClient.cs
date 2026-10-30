@@ -285,6 +285,8 @@ public class GenericTcpIpClient : Device, ISocketStatusWithStreamDebugging, IAut
             }
         }
 
+        TCPClient previousClient = null;
+
         lock (_connectLock)
         {
             if (IsConnected)
@@ -295,12 +297,42 @@ public class GenericTcpIpClient : Device, ISocketStatusWithStreamDebugging, IAut
             {
                 //Stop retry timer if running
                 RetryTimer.Stop();
+                previousClient = _client;
+                if (previousClient != null)
+                {
+                    previousClient.SocketStatusChange -= Client_SocketStatusChange;
+                }
                 _client = new TCPClient(Hostname, Port, BufferSize);
                 _client.SocketStatusChange -= Client_SocketStatusChange;
                 _client.SocketStatusChange += Client_SocketStatusChange;
                 DisconnectCalledByUser = false;
                 _client.ConnectToServerAsync(ConnectToServerCallback);
             }
+        }
+
+        // Outside the lock, so a status callback already running on the old client can't wait on it
+        DisposeClient(previousClient);
+    }
+
+    /// <summary>
+    /// Closes a client that a new connection attempt has replaced. Without this the old
+    /// client's socket stays open until the garbage collector finalizes it.
+    /// </summary>
+    /// <param name="client"></param>
+    private void DisposeClient(TCPClient client)
+    {
+        if (client == null)
+        {
+            return;
+        }
+
+        try
+        {
+            client.Dispose();
+        }
+        catch (Exception ex)
+        {
+            this.LogWarning("Error disposing previous client: {0}", ex.Message);
         }
     }
 
@@ -358,6 +390,11 @@ public class GenericTcpIpClient : Device, ISocketStatusWithStreamDebugging, IAut
     /// <param name="c"></param>
     void ConnectToServerCallback(TCPClient c)
     {
+        if (!ReferenceEquals(c, _client))
+        {
+            return;
+        }
+
         if (c.ClientStatus != SocketStatus.SOCKET_STATUS_CONNECTED)
         {
             this.LogInformation("Server connection result: {0}", c.ClientStatus);
@@ -397,7 +434,7 @@ public class GenericTcpIpClient : Device, ISocketStatusWithStreamDebugging, IAut
     /// <param name="numBytes"></param>
     void Receive(TCPClient client, int numBytes)
     {
-        if (client != null)
+        if (client != null && ReferenceEquals(client, _client))
         {
             if (numBytes > 0)
             {
@@ -473,6 +510,11 @@ public class GenericTcpIpClient : Device, ISocketStatusWithStreamDebugging, IAut
     /// <param name="clientSocketStatus"></param>
     void Client_SocketStatusChange(TCPClient client, SocketStatus clientSocketStatus)
     {
+        if (!ReferenceEquals(client, _client))
+        {
+            return;
+        }
+
         if (clientSocketStatus != SocketStatus.SOCKET_STATUS_CONNECTED)
         {
             this.LogDebug("Socket status change {0} ({1})", clientSocketStatus, ClientStatusText);
